@@ -2,14 +2,24 @@ import socket
 import json
 import struct
 import threading
+import random
 
 HOST = "127.0.0.1"
 PORT = 4444
+
+# global game_phase
+game_phase = "LOBBY"
+# server seq num
+server_seq_num = 0
 
 server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 server_socket.bind((HOST, PORT))
 server_socket.listen(5)
 print(f"[S] Listening on {HOST}:{PORT}")
+
+# load card deck
+with open("deck_list.json", "r") as f:
+    cards = json.load(f)
 
 connected_clients = []       
 players = {}                 
@@ -40,15 +50,18 @@ def recv_pdu(sock):
     return json.loads(payload.decode("utf-8"))
 
 def broadcast_lobby_status():
+    global server_seq_num
     """Send every ready player an updated GAME_STATE_UPDATE (lobby variant)."""
     ready_ids = [p["player_id"] for p in players.values()] 
     all_ids = ["player_1", "player_2"]  
     waiting_for = [pid for pid in all_ids if pid not in ready_ids]
 
     for conn in players:
+        server_seq_num += 1
+
         send_pdu(conn, {
             "type": "GAME_STATE_UPDATE",
-            "seq_num": 2, #todo: this is hardcoded for now, should be incremented per message
+            "seq_num": server_seq_num,
             "state": {
                 "phase": "LOBBY",
                 "players_ready": len(players),
@@ -57,17 +70,54 @@ def broadcast_lobby_status():
         })
 
 def handle_player_ready(conn, pdu):
+    global game_phase
+
+    if game_phase != "LOBBY":
+        send_pdu(conn, {
+            "type": "ERROR",
+            "seq_num": pdu.get("seq_num", 1),
+            "code": "INVALID_STATE",
+            "message": "PLAYER_READY is only allowed while in the LOBBY."
+        })
+        return
+    
     player_id = pdu.get("player_id")
     deck_list = pdu.get("deck_list")
 
-    #todo: Need to add rejection if card is not part of set. RFC 6.2 also requires rejecting decks with cards not in the legal card set. 
-    if not deck_list or len(deck_list) > 50:
+    # validate deck
+    if not isinstance(deck_list, list):
         send_pdu(conn, {
             "type": "ERROR",
             "seq_num": pdu.get("seq_num", 1),
             "code": "ILLEGAL_DECK",
-            "message": f"Deck contains {len(deck_list) if deck_list else 0} cards; must be 1-50."
+            "message": "Deck list is missing or invalid."
         })
+        return
+
+    # validate deck size
+    if len(deck_list) < 1 or len(deck_list) > 50:
+        send_pdu(conn, {
+        "type": "ERROR",
+        "seq_num": pdu.get("seq_num", 1),
+        "code": "ILLEGAL_DECK",
+        "message": f"Deck contains {len(deck_list)} cards; must be 1-50."
+    })
+        return
+
+    # validate every card ID
+    illegal_cards = [
+        card_id
+        for card_id in deck_list
+        if card_id not in cards
+    ]
+
+    if illegal_cards:
+        send_pdu(conn, {
+        "type": "ERROR",
+        "seq_num": pdu.get("seq_num", 1),
+        "code": "ILLEGAL_DECK",
+        "message": f"Unknown card IDs: {', '.join(illegal_cards)}"
+    })
         return
 
     with lock:
@@ -82,24 +132,95 @@ def handle_player_ready(conn, pdu):
                 })
                 return
 
-        players[conn] = {"player_id": player_id, "deck_list": deck_list}
+        players[conn] = {
+            "player_id": player_id, 
+            "deck_list": deck_list,
+            "library": [],
+            "hand": [],
+            "life": 20
+            }
         print(f"[S] {player_id} is ready with {len(deck_list)} cards ({len(players)}/2)")
 
     broadcast_lobby_status()
 
     if len(players) == 2:
+        game_phase = "GAME_SETUP"
         print("[S] Both players ready — would transition to GAME_SETUP here")
-        # todo: implement GAME_SETUP (RFC Section 6.3):
-        #   1. Validate both decks (already partly done)
-        #   2. Set both life totals to 20
-        #   3. Shuffle each deck 
-        #   4. Draw 7 cards each
-        #   5. Randomly pick who goes first (coin flip)
-        #   6. Send each player a personalized GAME_STATE_UPDATE (Section 6.3
-        #      example) showing their own hand + opponent's hand_count only
-        #      (never reveal the opponent's actual hand: RFC 12, Confidentiality)
-        #   7. Transition state to MULLIGAN (Section 6.4) and start handling
-        #      MULLIGAN_CHOICE PDUs
+        start_game_setup()
+
+def start_game_setup():
+    global game_phase
+    global server_seq_num
+
+    game_phase = "GAME_SETUP"
+    print("[S] Starting GAME_SETUP")
+
+    #initialize player life to 20
+    for player in players.values():
+        player["life"] = 20
+
+    # shuffle deck
+    for player in players.values():
+        player["library"] = player["deck_list"][:]
+        random.shuffle(player["library"])
+
+    # draw seven cards
+    for player in players.values():
+        player["hand"] = []
+
+        while player["library"] and len(player["hand"]) < 7:
+            player["hand"].append(player["library"].pop())
+
+    # choose player to start
+    starting_conn = random.choice(list(players.keys()))
+
+    for conn, player in players.items():
+        player["is_starting_player"] = (conn == starting_conn)
+
+    # send game state update
+    for conn, player in players.items():
+        server_seq_num += 1
+
+        send_pdu(conn,{
+            "type":"GAME_STATE_UPDATE",
+            "seq_num":server_seq_num,
+            "state": {
+                # setup complete, transitioned to MULLIGAN
+                "turn": 0,
+                "phase": "MULLIGAN",
+
+                # starting player / player inplay
+                "active_player": players[starting_conn]["player_id"],
+
+                "life_totals": {
+                    info["player_id"]: info["life"]
+                    for info in players.values()
+                },
+            # personalized player's hand
+            "hand":player["hand"],
+            
+            "hand_counts": {
+                info["player_id"]: len(info["hand"])
+                for info in players.values()
+            },
+            "library_count":{
+                info["player_id"]: len(info["library"])
+                for info in players.values()
+            },
+            "battlefield": {
+                info["player_id"]: []
+                for info in players.values()
+            },
+            "graveyard": {
+                info["player_id"]: []
+                for info in players.values()
+            },
+            "stack": []
+            }
+        })
+
+    game_phase = "MULLIGAN"
+    print("[S] Transitioned to MULLIGAN")
 
 def handle_client(conn, addr):
     print(f"[S] Handling client {addr}")
