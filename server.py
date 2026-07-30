@@ -234,13 +234,18 @@ def handle_client(conn, addr):
                 break
 
             if len(players) == 1:
-                send_pdu(conn, {
-                    "type":      "GAME_OVER",
-                    "seq_num":   pdu.get("seq_num", 0),
-                    "winner_id": "player_1",
-                    "loser_id":  "player_2",
-                    "reason":    "DISCONNECT"
-                    })
+                for winner in players.values():
+                    if winner["player_id"] == "player_1":
+                        loser = "player_2"
+                    else:
+                        loser = "player_1"
+                    send_pdu(conn, {
+                        "type":      "GAME_OVER",
+                        "seq_num":   pdu.get("seq_num", 0),
+                        "winner_id": winner["player_id"],
+                        "loser_id":  loser,
+                        "reason":    f"DISCONNECT"
+                        })
 
             print(f"[S] Received: {pdu}")
             msg_type = pdu.get("type")
