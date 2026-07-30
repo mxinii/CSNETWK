@@ -233,6 +233,15 @@ def handle_client(conn, addr):
                 # player. atm nothing is sent to the remaining player.
                 break
 
+            if len(players) == 1:
+                send_pdu(conn, {
+                    "type":      "GAME_OVER",
+                    "seq_num":   pdu.get("seq_num", 0),
+                    "winner_id": "player_1",
+                    "loser_id":  "player_2",
+                    "reason":    "DISCONNECT"
+                    })
+
             print(f"[S] Received: {pdu}")
             msg_type = pdu.get("type")
 
