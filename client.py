@@ -72,10 +72,11 @@ player_ready = {
 
 # send PLAYER_READY
 send_pdu(client_socket, player_ready)
+print("[C] Ready state sent. Waiting for server state update...\n")
 
 mulligan_count = 0  # tracks how many times we've mulliganed, used to size cards_to_bottom
 
-# receive the lobby update
+# main event loop
 while True:
     reply = recv_pdu(client_socket)
 
@@ -87,6 +88,7 @@ while True:
 
     if msg_type == "GAME_STATE_UPDATE":
         state = reply.get("state", {})
+        phase = state.get("phase")
 
         print(f"\n=== {state.get('phase')} ===")
 
@@ -133,9 +135,57 @@ while True:
                     "cards_to_bottom": []
                 })
 
+        elif state.get("phase") == "IN_GAME":
+            step = state.get("step")
+            hand = state.get("hand", [])
+            print(f"Turn: {state.get('turn')} | Active Player: {state.get('active_player')} | Step: {step}")
+            print(f"Life: {state.get('life_totals')} | Hand: {hand}")
+
+            # Hand Size Enforcement during Cleanup Step (RFC 7.8)
+            if step == "CLEANUP" and state.get("active_player") == player_id and len(hand) > 7:
+                excess = len(hand) - 7
+                print(f"\n[CLEANUP] Your hand size exceeds 7! You must discard {excess} card(s).")
+                discard_list = []
+                for i in range(excess):
+                    card = input(f"  Card {i+1} ID to discard: ").strip()
+                    discard_list.append(card)
+
+                send_pdu(client_socket, {
+                    "type": "DISCARD",
+                    "seq_num": reply["seq_num"],  # Echo last GAME_STATE_UPDATE seq_num
+                    "card_ids": discard_list
+                })
+
+    elif msg_type == "PRIORITY_GRANT":
+        # NEW: Basic Priority Passing (RFC Section 8)
+        print(f"\n[PRIORITY] You have priority (seq_num: {reply.get('seq_num')}).")
+        action = input("Action? (p = pass priority / c = concede): ").strip().lower()
+        
+        if action == "c":
+            send_pdu(client_socket, {
+                "type": "CONCEDE",
+                "seq_num": reply.get("seq_num")
+            })
+        else:
+            send_pdu(client_socket, {
+                "type": "PRIORITY_PASS",
+                "seq_num": reply.get("seq_num")
+            })
+
     elif msg_type == "PHASE_TRANSITION":
         print(f"\n=== PHASE_TRANSITION: {reply.get('from_phase')} -> {reply.get('to_phase')} "
               f"(turn {reply.get('turn')}, active: {reply.get('active_player')}) ===")
+
+    elif msg_type == "GAME_OVER":
+        # NEW: Game Over Notification (RFC Section 6.6)
+        print(f"\n==========================================")
+        print(f" GAME OVER!")
+        print(f" Winner: {reply.get('winner_id')}")
+        print(f" Reason: {reply.get('reason')}")
+        print(f"==========================================\n")
+        
+        # Reset local state for the next match
+        mulligan_count = 0
 
     elif msg_type == "PONG":
         print("[C] Received PONG")

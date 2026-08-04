@@ -149,63 +149,40 @@ def handle_player_ready(conn, pdu):
     player_id = pdu.get("player_id")
     deck_list = pdu.get("deck_list")
 
-    # validate deck
-    if not isinstance(deck_list, list):
+    # Validate deck list format
+    if not isinstance(deck_list, list) or len(deck_list) < 1 or len(deck_list) > 50:
         send_pdu(conn, {
             "type": "ERROR",
             "seq_num": pdu.get("seq_num", 1),
             "code": "ILLEGAL_DECK",
-            "message": "Deck list is missing or invalid."
+            "message": f"Deck contains {len(deck_list) if isinstance(deck_list, list) else 0} cards; must be 1-50."
         })
         return
 
-    # validate deck size
-    if len(deck_list) < 1 or len(deck_list) > 50:
-        send_pdu(conn, {
-        "type": "ERROR",
-        "seq_num": pdu.get("seq_num", 1),
-        "code": "ILLEGAL_DECK",
-        "message": f"Deck contains {len(deck_list)} cards; must be 1-50."
-    })
-        return
-
-    # validate every card ID
-    illegal_cards = [
-        card_id
-        for card_id in deck_list
-        if card_id not in cards
-    ]
-
+    # Validate card IDs
+    illegal_cards = [card_id for card_id in deck_list if card_id not in cards]
     if illegal_cards:
-        send_pdu(conn, {
-        "type": "ERROR",
-        "seq_num": pdu.get("seq_num", 1),
-        "code": "ILLEGAL_DECK",
-        "message": f"Unknown card IDs: {', '.join(illegal_cards)}"
-    })
-        return
-
-    # each entry is a specific physical card instance (e.g. "mountain_001"),
-    # so the same instance can't legally appear twice in one deck
-    seen = set()
-    duplicate_cards = []
-    for card_id in deck_list:
-        if card_id in seen and card_id not in duplicate_cards:
-            duplicate_cards.append(card_id)
-        seen.add(card_id)
-
-    if duplicate_cards:
         send_pdu(conn, {
             "type": "ERROR",
             "seq_num": pdu.get("seq_num", 1),
             "code": "ILLEGAL_DECK",
-            "message": f"Duplicate card instance(s) in deck: {', '.join(duplicate_cards)}"
+            "message": f"Unknown card IDs: {', '.join(illegal_cards)}"
+        })
+        return
+
+    # Validate duplicates
+    if len(deck_list) != len(set(deck_list)):
+        send_pdu(conn, {
+            "type": "ERROR",
+            "seq_num": pdu.get("seq_num", 1),
+            "code": "ILLEGAL_DECK",
+            "message": "Duplicate card instance(s) in deck."
         })
         return
 
     should_start_setup = False
     with lock:
-        # Reject a duplicate player_id 
+        # Check duplicate ID across existing connections
         for other_conn, other_info in players.items():
             if other_conn != conn and other_info["player_id"] == player_id:
                 send_pdu(conn, {
@@ -216,24 +193,29 @@ def handle_player_ready(conn, pdu):
                 })
                 return
 
-        players[conn] = {
-            "player_id": player_id, 
-            "deck_list": deck_list,
-            "library": [],
-            "hand": [],
-            "life": 20,
-            "mulligan_count": 0,
-            "kept": False,
-            "last_state_seq_num": None,
-            "battlefield": [],
-            "graveyard": [],
-            "land_played_this_turn": False
+        # Add or update player outside of the loop
+        if conn in players:
+            players[conn]["player_id"] = player_id
+            players[conn]["deck_list"] = deck_list
+            print(f"[S] {player_id} updated their deck ({len(deck_list)} cards)")
+        else:
+            players[conn] = {
+                "player_id": player_id,
+                "deck_list": deck_list,
+                "library": [],
+                "hand": [],
+                "life": 20,
+                "mulligan_count": 0,
+                "kept": False,
+                "last_state_seq_num": None,
+                "battlefield": [],
+                "graveyard": [],
+                "land_played_this_turn": False,
+                "connected": True,
+                "reconnect_timer": None
             }
-        print(f"[S] {player_id} is ready with {len(deck_list)} cards ({len(players)}/2)")
+            print(f"[S] {player_id} is ready with {len(deck_list)} cards ({len(players)}/2)")
 
-        # Decide the LOBBY -> GAME_SETUP transition while still holding the lock so
-        # exactly one of the two client threads (whichever inserts the 2nd player)
-        # triggers start_game_setup(), never both concurrently.
         if len(players) == 2 and game_phase == "LOBBY":
             game_phase = "GAME_SETUP"
             should_start_setup = True
@@ -334,6 +316,11 @@ def build_ingame_state(player):
 def broadcast_ingame_state():
     """Send every player a personalized IN_GAME GAME_STATE_UPDATE."""
     global server_seq_num
+
+    # check for state-based win/loss conditions
+    if check_life_totals():
+        return #trigger_game_over() is called
+    
     for conn, player in list(players.items()):
         server_seq_num += 1
         send_pdu(conn, {
@@ -439,6 +426,9 @@ def begin_turn(conn, turn_num, from_phase):
             "turn": turn_num
         })
 
+    # broadcast the untaapped state to both players (RFC 7.2)
+    broadcast_ingame_state()
+
     print(f"[S] Turn {turn_num} — {player['player_id']} untaps")
 
     # UNTAP never opens a priority window — go straight to UPKEEP.
@@ -533,41 +523,103 @@ def advance_step():
     enter_step(next_step)
 
 def do_cleanup_step():
-    """RFC 7.8: remove damage, clear until-end-of-turn effects, then start
-    the other player's next turn.
-    TODO: if AP's hand exceeds 7 cards, this should send GAME_STATE_UPDATE
-    and await DISCARD PDU(s) before proceeding — not yet implemented, so
-    hand size isn't currently enforced at cleanup."""
+    """RFC 7.8: Remove damage, clear until-end-of-turn effects, enforce maximum
+    hand size (7 cards), and start the next player's turn."""
     active_player = players[active_conn]
     print(f"[S] Cleanup — turn {turn_number} ends for {active_player['player_id']}")
 
-    # No damage/until-end-of-turn effects exist yet (no combat/spells), so
-    # there's nothing to clear yet — this is where that logic goes later.
+    # Check maximum hand size requirement (RFC 7.8)
+    if len(active_player["hand"]) > 7:
+        print(f"[S] {active_player['player_id']} has {len(active_player['hand'])} cards; awaiting DISCARD PDU(s)...")
+        # Send an updated state to the AP so they have the seq_num to echo in DISCARD
+        global server_seq_num
+        server_seq_num += 1
+        active_player["last_state_seq_num"] = server_seq_num
+        send_pdu(active_conn, {
+            "type": "GAME_STATE_UPDATE",
+            "seq_num": server_seq_num,
+            "state": build_ingame_state(active_player)
+        })
+        return  # Pause and wait for handle_discard
 
+    finish_cleanup_step()
+
+def finish_cleanup_step():
+    """Clear end-of-turn state and advance to the next player's Untap Step."""
+    # Remove all damage from creatures and clear "until end of turn" effects
+    for player in players.values():
+        for permanent in player["battlefield"]:
+            permanent["damage"] = 0  # Ready for when damage/creatures are added
+            # clear "until end of turn" temporary modifiers here when implemented
+
+    # Broadcast updated game state reflecting the cleared state
+    broadcast_ingame_state()
+
+    # Increment turn counter, switch Active Player, and begin Untap Step
     next_conn = get_other_conn(active_conn)
     begin_turn(next_conn, turn_number + 1, from_phase="CLEANUP")
 
+def check_life_totals():
+    """Checks if any player's life total has reached <= 0 (RFC 6.5)."""
+    if game_phase != "IN_GAME":
+        return False
+
+    dead_players = [conn for conn, info in players.items() if info["life"] <= 0]
+    if dead_players:
+        # If one player drops <= 0, the other wins
+        for conn in list(players.keys()):
+            if conn not in dead_players:
+                trigger_game_over(conn, "LIFE_ZERO")
+                return True
+    return False
+
 def trigger_game_over(winner_conn, reason):
     """Broadcast GAME_OVER and return to LOBBY (RFC Section 6.6)."""
-    global game_phase, server_seq_num
+    global game_phase, server_seq_num, turn_number, current_step
     winner_id = players[winner_conn]["player_id"]
     loser_conn = get_other_conn(winner_conn)
     loser_id = players[loser_conn]["player_id"] if loser_conn else None
 
+    # cancel any running reconnect timers
+    for info in players.values():
+        if info.get("reconnect_timer"):
+            info["reconnect_timer"].cancel()
+            info["reconnect_timer"] = None
+
     for conn in list(players.keys()):
-        server_seq_num += 1
-        send_pdu(conn, {
-            "type": "GAME_OVER",
-            "seq_num": server_seq_num,
-            "winner_id": winner_id,
-            "loser_id": loser_id,
-            "reason": reason
-        })
+        if players[conn].get("connected", True):
+            server_seq_num += 1
+            send_pdu(conn, {
+                "type": "GAME_OVER",
+                "seq_num": server_seq_num,
+                "winner_id": winner_id,
+                "loser_id": loser_id,
+                "reason": reason
+            })
 
     print(f"[S] GAME_OVER — {winner_id} wins ({reason})")
+
+    # reset internal game state variables
     game_phase = "LOBBY"
-    # TODO: RFC 6.6 — reset per-player mulligan/hand/life/battlefield state
-    # so a fresh PLAYER_READY can start a new game on the same connections.
+    turn_number = 0
+    current_step = None
+    stack.clear()
+
+    # reset player-specific game state for remaining connections
+    for player_info in players.values():
+        player_info["library"] = []
+        player_info["hand"] = []
+        player_info["battlefield"] = []
+        player_info["graveyard"] = []
+        player_info["life"] = 20
+        player_info["mulligan_count"] = 0
+        player_info["kept"] = False
+        player_info["is_starting_player"] = False
+        player_info["land_played_this_turn"] = False
+
+    # Notify remaining clients of returning to LOBBY
+    broadcast_lobby_status()
+    
 
 def handle_priority_pass(conn, pdu):
     """Handle a PRIORITY_PASS PDU (RFC Section 8.2)."""
@@ -719,6 +771,50 @@ def handle_play_land(conn, pdu):
         # AP retains priority — issue a fresh PRIORITY_GRANT (RFC 7.5).
         open_priority_window()
 
+RECONNECT_TIMEOUT_SEC = 30.0  # Adjust implementation-defined timeout as needed
+
+def handle_reconnect_timeout(player_id):
+    """Callback when reconnect timer expires."""
+    with lock:
+        if game_phase not in ("IN_GAME", "MULLIGAN"):
+            return
+
+        # Find the player who timed out
+        offending_conn = None
+        for conn, info in players.items():
+            if info["player_id"] == player_id and not info["connected"]:
+                offending_conn = conn
+                break
+
+        if offending_conn:
+            print(f"[S] Reconnect timer expired for {player_id}.")
+            winner_conn = get_other_conn(offending_conn)
+            if winner_conn:
+                trigger_game_over(winner_conn, "DISCONNECT")
+
+
+def handle_disconnect(conn):
+    """Handle lost connection with a grace period timer."""
+    global game_phase
+    with lock:
+        if conn not in players:
+            return
+
+        player_info = players[conn]
+        player_info["connected"] = False
+        pid = player_info["player_id"]
+
+        if game_phase in ("IN_GAME", "MULLIGAN"):
+            print(f"[S] {pid} disconnected. Starting {RECONNECT_TIMEOUT_SEC}s reconnect timer...")
+            
+            # Start timer thread to wait for reconnection
+            timer = threading.Timer(RECONNECT_TIMEOUT_SEC, handle_reconnect_timeout, args=[pid])
+            player_info["reconnect_timer"] = timer
+            timer.start()
+        else:
+            # In LOBBY or GAME_OVER, remove connection immediately
+            del players[conn]
+
 def handle_mulligan_choice(conn, pdu):
     """Handle a MULLIGAN_CHOICE PDU per RFC Section 6.4."""
     global server_seq_num
@@ -804,6 +900,25 @@ def handle_mulligan_choice(conn, pdu):
             })
             print(f"[S] {player['player_id']} mulliganed (count={player['mulligan_count']}), redrew 7 cards.")
 
+def handle_concede(conn, pdu):
+    """Handle a CONCEDE PDU from a player (RFC 6.5 / 6.6)."""
+    global game_phase
+    if game_phase not in ("IN_GAME", "MULLIGAN"):
+        send_pdu(conn, {
+            "type": "ERROR",
+            "seq_num": pdu.get("seq_num", 0),
+            "code": "WRONG_PHASE",
+            "message": "Cannot concede outside of an active game.",
+            "rejected_action": pdu
+        })
+        return
+
+    with lock:
+        winner_conn = get_other_conn(conn)
+        if winner_conn:
+            print(f"[S] {players[conn]['player_id']} conceded.")
+            trigger_game_over(winner_conn, "CONCEDE")
+
 def handle_client(conn, addr):
     print(f"[S] Handling client {addr}")
     try:
@@ -811,8 +926,8 @@ def handle_client(conn, addr):
             pdu = recv_pdu(conn)
             if pdu is None:
                 print(f"[S] Client {addr} disconnected")
-                #todo: RFC 4.2 states disconnect during a game should trigger GAME_OVER with reason DISCONNECT, broadcast to the OTHER
-                # player. atm nothing is sent to the remaining player.
+                # If disconnected during an active game, remaining player wins
+                handle_disconnect(conn)
                 break
 
             msg_type = pdu.get("type")
@@ -827,6 +942,8 @@ def handle_client(conn, addr):
                 handle_priority_pass(conn, pdu)
             elif msg_type == "PLAY_LAND":
                 handle_play_land(conn, pdu)
+            elif msg_type == "CONCEDE":
+                handle_concede(conn, pdu)
             else:
                 send_pdu(conn, {
                     "type": "ERROR",
@@ -839,7 +956,8 @@ def handle_client(conn, addr):
         with lock:
             if conn in connected_clients:
                 connected_clients.remove(conn)
-            if conn in players:
+            # Only delete from players dict if in LOBBY/GAME_OVER (not waiting on a reconnect timer)
+            if conn in players and game_phase not in ("IN_GAME", "MULLIGAN"):
                 del players[conn]
 
 while True:
