@@ -5,9 +5,16 @@ import threading
 import random
 import argparse
 import datetime
+import time
+from protocol import MAX_PDU_SIZE, ProtocolError, encode_pdu, recv_pdu as wire_recv_pdu
 
 HOST = "127.0.0.1"
 PORT = 4444
+
+def port_number(value):
+    value=int(value)
+    if not 1 <= value <= 65535: raise argparse.ArgumentTypeError("port must be 1-65535")
+    return value
 
 # --- verbose mode setup ---
 # Parse --verbose / -v at startup. VERBOSE is a module-level flag that every
@@ -16,8 +23,11 @@ PORT = 4444
 parser = argparse.ArgumentParser(description="MTGNP Game Server")
 parser.add_argument("-v", "--verbose", action="store_true",
                      help="Print every PDU sent/received to the console")
+parser.add_argument("--host", default=HOST, help="Interface to bind (default: 127.0.0.1)")
+parser.add_argument("--port", type=port_number, default=PORT)
 args = parser.parse_args()
 VERBOSE = args.verbose
+HOST, PORT = args.host, args.port
 
 def log_pdu(direction: str, peer_label: str, pdu: dict):
     """Print a clearly-labelled, readable line for every PDU when verbose mode is on.
@@ -44,19 +54,24 @@ priority_seq_num = None    # seq_num the priority holder must echo in PRIORITY_P
 consecutive_passes = 0     # how many players have passed in a row in this window
 stack = []                  # shared LIFO stack (empty until CAST_SPELL exists)
 
-# Step order used by advance_step(). Combat's sub-steps (Section 9) aren't
-# implemented yet, so PRECOMBAT_MAIN currently skips straight to
-# POSTCOMBAT_MAIN — TODO: insert BEGIN_COMBAT..END_OF_COMBAT here later.
+# Complete turn and combat sub-step order used by advance_step().
 STEP_SEQUENCE = {
     "UPKEEP": "DRAW",
     "DRAW": "PRECOMBAT_MAIN",
-    "PRECOMBAT_MAIN": "POSTCOMBAT_MAIN",
+    "PRECOMBAT_MAIN": "BEGIN_COMBAT",
+    "BEGIN_COMBAT": "DECLARE_ATTACKERS",
+    "DECLARE_ATTACKERS": "DECLARE_BLOCKERS",
+    "DECLARE_BLOCKERS": "ASSIGN_DAMAGE_ORDER",
+    "ASSIGN_DAMAGE_ORDER": "COMBAT_DAMAGE",
+    "FIRST_STRIKE_DAMAGE": "COMBAT_DAMAGE",
+    "COMBAT_DAMAGE": "END_OF_COMBAT",
+    "END_OF_COMBAT": "POSTCOMBAT_MAIN",
     "POSTCOMBAT_MAIN": "END_STEP",
     "END_STEP": "CLEANUP",
 }
 # Steps that open a priority window (all of Section 7's steps except UNTAP
 # and CLEANUP, which never grant priority per the RFC).
-PRIORITY_STEPS = {"UPKEEP", "DRAW", "PRECOMBAT_MAIN", "POSTCOMBAT_MAIN", "END_STEP"}
+PRIORITY_STEPS = {"UPKEEP", "DRAW", "PRECOMBAT_MAIN", "BEGIN_COMBAT", "END_OF_COMBAT", "POSTCOMBAT_MAIN", "END_STEP"}
 
 server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -72,7 +87,16 @@ with open("card_instances.json", "r") as f:
 
 connected_clients = []       
 players = {}                 
-lock = threading.Lock()  # to protect shared state
+lock = threading.RLock()  # callbacks may safely invoke other state-changing helpers
+stack_counter = 0
+attackers = []
+blockers = {}
+damage_orders = {}
+trigger_counter = 0
+pending_trigger_orders = {}
+pending_trigger_choices = {}
+trigger_resume_conn = None
+combat_request_seq = None
 
 def get_peer_label(sock):
     """Prefer the player_id if this connection has registered one; fall back to address."""
@@ -86,10 +110,10 @@ def get_peer_label(sock):
         return "unknown"
 
 def send_pdu(sock, pdu: dict): #to send a PDU to the socket
+    if not isinstance(pdu, dict) or "type" not in pdu or "seq_num" not in pdu:
+        raise ValueError("Every PDU must contain type and seq_num")
     log_pdu("SEND", get_peer_label(sock), pdu)
-    payload = json.dumps(pdu).encode("utf-8")
-    length_prefix = struct.pack(">I", len(payload)) 
-    sock.sendall(length_prefix + payload)
+    sock.sendall(encode_pdu(pdu))
 
 def recv_exact(sock, n): #to recv exact n bytes from socket
     data = b""
@@ -101,14 +125,8 @@ def recv_exact(sock, n): #to recv exact n bytes from socket
     return data
 
 def recv_pdu(sock):
-    length_bytes = recv_exact(sock, 4)
-    if length_bytes is None:
-        return None
-    length = struct.unpack(">I", length_bytes)[0]
-    payload = recv_exact(sock, length)
-    if payload is None:
-        return None
-    pdu = json.loads(payload.decode("utf-8"))
+    pdu = wire_recv_pdu(sock)
+    if pdu is None: return None
     log_pdu("RECV", get_peer_label(sock), pdu)
     return pdu
 
@@ -135,7 +153,30 @@ def broadcast_lobby_status():
         })
 
 def handle_player_ready(conn, pdu):
-    global game_phase
+    global game_phase, active_conn, priority_conn
+
+    # A disconnected player reclaims the same authoritative state by presenting
+    # the same ID and deck before the grace timer expires.
+    requested_id = pdu.get("player_id")
+    with lock:
+        old_conn = next((c for c, info in players.items()
+                         if info.get("player_id") == requested_id and not info.get("connected", True)), None)
+        if old_conn is not None and game_phase in ("MULLIGAN", "IN_GAME"):
+            info = players.pop(old_conn)
+            if pdu.get("deck_list") != info.get("deck_list"):
+                players[old_conn] = info
+                send_pdu(conn, {"type": "ERROR", "seq_num": pdu.get("seq_num", 0), "code": "ILLEGAL_DECK", "message": "Reconnect deck does not match."})
+                return
+            if info.get("reconnect_timer"): info["reconnect_timer"].cancel()
+            info.update({"connected": True, "reconnect_timer": None})
+            players[conn] = info
+            if active_conn is old_conn: active_conn = conn
+            if priority_conn is old_conn: priority_conn = conn
+            send_pdu(conn, {"type": "GAME_STATE_UPDATE", "seq_num": next_server_seq(),
+                            "state": build_personalized_mulligan_state(info) if game_phase == "MULLIGAN" else build_ingame_state(info)})
+            if priority_conn is conn: grant_priority(conn)
+            print(f"[S] {requested_id} reconnected")
+            return
 
     if game_phase != "LOBBY":
         send_pdu(conn, {
@@ -150,7 +191,11 @@ def handle_player_ready(conn, pdu):
     deck_list = pdu.get("deck_list")
 
     # Validate deck list format
-    if not isinstance(deck_list, list) or len(deck_list) < 1 or len(deck_list) > 50:
+    if not string_id(player_id):
+        send_pdu(conn, {"type": "ERROR", "seq_num": pdu.get("seq_num", 0),
+                        "code": "ILLEGAL_ACTION", "message": "player_id must be non-empty."})
+        return
+    if not string_list(deck_list,True) or len(deck_list) < 1 or len(deck_list) > 50:
         send_pdu(conn, {
             "type": "ERROR",
             "seq_num": pdu.get("seq_num", 1),
@@ -211,6 +256,7 @@ def handle_player_ready(conn, pdu):
                 "battlefield": [],
                 "graveyard": [],
                 "land_played_this_turn": False,
+                "mana_pool": {c: 0 for c in "WUBRGC"},
                 "connected": True,
                 "reconnect_timer": None
             }
@@ -284,14 +330,16 @@ def build_ingame_state(player):
     (RFC Section 10.2.2, in-game variant)."""
     return {
         "turn": turn_number,
-        "phase": current_step,
+        "phase": "IN_GAME",
+        "step": current_step,
         "active_player": players[active_conn]["player_id"],
         "priority_holder": players[priority_conn]["player_id"] if priority_conn else None,
         "life_totals": {
             info["player_id"]: info["life"]
             for info in players.values()
         },
-        "stack": stack,
+        "stack": [{"stack_item_id": x["stack_item_id"], "item_type": x["item_type"],
+                   "source": x["source_id"], "controller": x["controller_id"], "targets": x["targets"]} for x in stack],
         "battlefield": {
             info["player_id"]: info["battlefield"]
             for info in players.values()
@@ -408,12 +456,11 @@ def begin_turn(conn, turn_num, from_phase):
 
     player = players[active_conn]
 
-    # Untap: no permanents exist yet (battlefield isn't populated until
-    # PLAY_LAND / CAST_SPELL land support is added), so this loop is a no-op
-    # for now — but it's exactly where untap logic goes once permanents exist.
+    # Untap every permanent controlled by the active player.
     for permanent in player["battlefield"]:
         permanent["tapped"] = False
     player["land_played_this_turn"] = False
+    player["mana_pool"] = {c: 0 for c in "WUBRGC"}
 
     server_seq_num += 1
     for c in list(players.keys()):
@@ -460,6 +507,18 @@ def enter_step(step_name):
         do_cleanup_step()
         return
 
+    if step_name == "DECLARE_ATTACKERS":
+        return
+    if step_name == "DECLARE_BLOCKERS":
+        return
+    if step_name == "ASSIGN_DAMAGE_ORDER":
+        if any(len(v) > 1 for v in blockers.values()): return
+        else: begin_combat_damage()
+        return
+    if step_name == "COMBAT_DAMAGE":
+        resolve_combat_damage(first_strike=False)
+        return
+
     if step_name in PRIORITY_STEPS:
         open_priority_window()
 
@@ -502,7 +561,7 @@ def advance_step():
     """Called when both players have passed priority consecutively with an
     empty stack (RFC Section 8.1, rule 6). Moves to the next step per the
     Section 7 turn structure, or starts the next player's turn at CLEANUP."""
-    global server_seq_num
+    global server_seq_num, combat_request_seq
 
     next_step = STEP_SEQUENCE.get(current_step)
     if next_step is None:
@@ -510,6 +569,8 @@ def advance_step():
 
     old_step = current_step
     server_seq_num += 1
+    if next_step in ("DECLARE_ATTACKERS", "DECLARE_BLOCKERS", "ASSIGN_DAMAGE_ORDER"):
+        combat_request_seq = server_seq_num
     for conn in list(players.keys()):
         send_pdu(conn, {
             "type": "PHASE_TRANSITION",
@@ -549,7 +610,9 @@ def finish_cleanup_step():
     # Remove all damage from creatures and clear "until end of turn" effects
     for player in players.values():
         for permanent in player["battlefield"]:
-            permanent["damage"] = 0  # Ready for when damage/creatures are added
+            permanent["damage"] = 0
+            permanent.pop("power_bonus", None)
+            permanent.pop("toughness_bonus", None)
             # clear "until end of turn" temporary modifiers here when implemented
 
     # Broadcast updated game state reflecting the cleared state
@@ -575,7 +638,7 @@ def check_life_totals():
 
 def trigger_game_over(winner_conn, reason):
     """Broadcast GAME_OVER and return to LOBBY (RFC Section 6.6)."""
-    global game_phase, server_seq_num, turn_number, current_step
+    global game_phase, server_seq_num, turn_number, current_step, priority_conn, active_conn, attackers, blockers, damage_orders
     winner_id = players[winner_conn]["player_id"]
     loser_conn = get_other_conn(winner_conn)
     loser_id = players[loser_conn]["player_id"] if loser_conn else None
@@ -604,6 +667,9 @@ def trigger_game_over(winner_conn, reason):
     turn_number = 0
     current_step = None
     stack.clear()
+    pending_trigger_orders.clear(); pending_trigger_choices.clear()
+    attackers = []; blockers = {}; damage_orders = {}
+    priority_conn = None; active_conn = None
 
     # reset player-specific game state for remaining connections
     for player_info in players.values():
@@ -616,6 +682,7 @@ def trigger_game_over(winner_conn, reason):
         player_info["kept"] = False
         player_info["is_starting_player"] = False
         player_info["land_played_this_turn"] = False
+        player_info["mana_pool"] = {c: 0 for c in "WUBRGC"}
 
     # Notify remaining clients of returning to LOBBY
     broadcast_lobby_status()
@@ -660,11 +727,10 @@ def handle_priority_pass(conn, pdu):
         print(f"[S] {players[conn]['player_id']} passes priority ({consecutive_passes}/2)")
 
         if consecutive_passes >= 2:
-            # Both passed consecutively. Stack is always empty for now (no
-            # CAST_SPELL yet) — once it exists, check `stack` here and
-            # resolve the top item instead of advancing when non-empty
-            # (RFC Section 8.1, rule 5 vs rule 6).
-            advance_step()
+            if stack:
+                resolve_stack_top()
+            else:
+                advance_step()
         else:
             grant_priority(get_other_conn(conn))
 
@@ -848,6 +914,10 @@ def handle_mulligan_choice(conn, pdu):
 
         keep = pdu.get("keep")
         cards_to_bottom = pdu.get("cards_to_bottom", [])
+        if not isinstance(keep,bool) or not string_list(cards_to_bottom,True):
+            error(conn,pdu,"ILLEGAL_ACTION","keep must be boolean and cards_to_bottom must be a unique card-ID list."); return
+        if not keep and cards_to_bottom:
+            error(conn,pdu,"ILLEGAL_ACTION","cards_to_bottom must be empty when mulliganing."); return
 
         if keep:
             mulligan_count = player["mulligan_count"]
@@ -919,11 +989,486 @@ def handle_concede(conn, pdu):
             print(f"[S] {players[conn]['player_id']} conceded.")
             trigger_game_over(winner_conn, "CONCEDE")
 
+def error(conn, pdu, code, message):
+    send_pdu(conn, {"type": "ERROR", "seq_num": pdu.get("seq_num", 0),
+                    "code": code, "message": message, "rejected_action": pdu})
+
+def string_id(value):
+    return isinstance(value,str) and 0 < len(value.strip()) <= 128 and not any(ord(ch)<32 for ch in value)
+
+def string_list(value, unique=False):
+    return isinstance(value,list) and all(string_id(x) for x in value) and (not unique or len(value)==len(set(value)))
+
+def require_fields(conn,pdu,checks):
+    """checks maps field names to predicates; malformed fields never reach game logic."""
+    bad=[name for name,predicate in checks.items() if not predicate(pdu.get(name))]
+    if bad:
+        error(conn,pdu,"ILLEGAL_ACTION","Malformed or missing field(s): "+", ".join(bad))
+        return False
+    return True
+
+def validate_priority(conn, pdu):
+    if game_phase != "IN_GAME":
+        error(conn, pdu, "WRONG_PHASE", "Action is only valid during IN_GAME.")
+        return False
+    if conn != priority_conn:
+        error(conn, pdu, "NOT_YOUR_PRIORITY", "You do not hold priority.")
+        return False
+    if pdu.get("seq_num") != priority_seq_num:
+        error(conn, pdu, "STALE_ACTION", f"Expected seq_num {priority_seq_num}.")
+        return False
+    return True
+
+def broadcast(pdu):
+    for c, info in list(players.items()):
+        if info.get("connected", True):
+            send_pdu(c, dict(pdu))
+
+def mana_available(player):
+    pool = {c: 0 for c in "WUBRG"}
+    lands = []
+    subtype_color = {"Plains": "W", "Island": "U", "Swamp": "B", "Mountain": "R", "Forest": "G"}
+    for perm in player["battlefield"]:
+        info = cards.get(perm["id"], {})
+        if info.get("card_type") == "Land" and not perm.get("tapped"):
+            color = next((v for k, v in subtype_color.items() if k in str(info.get("subtype"))), info.get("color"))
+            if color in pool:
+                pool[color] += 1
+                lands.append((perm, color))
+    return pool, lands
+
+def pay_mana(player, card):
+    pool, lands = mana_available(player)
+    cost = {k: int(v or 0) for k, v in card.get("cost", {}).items()}
+    mana_pool = player.setdefault("mana_pool", {c: 0 for c in "WUBRGC"})
+    for color in "WUBRG":
+        use = min(mana_pool.get(color, 0), cost.get(color, 0)); mana_pool[color] -= use; cost[color] -= use
+        if pool[color] < cost.get(color, 0):
+            return False
+        pool[color] -= cost.get(color, 0)
+    if sum(pool.values()) < cost.get("Generic", 0):
+        return False
+    needed = {c: cost.get(c, 0) for c in "WUBRG"}
+    generic = cost.get("Generic", 0)
+    for perm, color in lands:
+        if needed[color] > 0:
+            perm["tapped"] = True; needed[color] -= 1
+        elif generic > 0:
+            perm["tapped"] = True; generic -= 1
+    return True
+
+def pay_generic(player, amount):
+    pool = player.setdefault("mana_pool", {c: 0 for c in "WUBRGC"})
+    for color in "WUBRGC":
+        used = min(pool.get(color, 0), amount); pool[color] -= used; amount -= used
+    if amount == 0: return True
+    _, lands = mana_available(player)
+    if len(lands) < amount: return False
+    for perm, _ in lands[:amount]: perm["tapped"] = True
+    return True
+
+def legal_target(target):
+    if target in [p["player_id"] for p in players.values()]:
+        return True
+    return any(target == perm.get("id") for p in players.values() for perm in p["battlefield"])
+
+def handle_cast_spell(conn, pdu):
+    global stack_counter, consecutive_passes, trigger_resume_conn
+    with lock:
+        if not validate_priority(conn, pdu): return
+        if not require_fields(conn,pdu,{"card_id":string_id,"targets":lambda x:string_list(x,True),
+                                        "mana_payment":lambda x:isinstance(x,dict) and all(k in "WUBRGX" and isinstance(v,int) and not isinstance(v,bool) and v>=0 for k,v in x.items())}): return
+        card_id = pdu.get("card_id")
+        if not string_id(card_id):
+            error(conn,pdu,"ILLEGAL_ACTION","card_id must be a non-empty string."); return
+        if not string_id(card_id):
+            error(conn,pdu,"ILLEGAL_ACTION","card_id must be a non-empty string."); return
+        player = players[conn]
+        card = cards.get(card_id)
+        if card_id not in player["hand"] or not card or card.get("card_type") == "Land":
+            error(conn, pdu, "ILLEGAL_ACTION", "Spell card is not in your hand."); return
+        if card.get("card_type") in ("Creature", "Sorcery") and (conn != active_conn or current_step not in ("PRECOMBAT_MAIN", "POSTCOMBAT_MAIN") or stack):
+            error(conn, pdu, "WRONG_PHASE", "Sorcery-speed spell cannot be cast now."); return
+        targets = pdu.get("targets", [])
+        if not isinstance(targets, list) or any(not legal_target(t) for t in targets):
+            error(conn, pdu, "ILLEGAL_TARGET", "One or more targets are illegal."); return
+        if not pay_mana(player, card):
+            error(conn, pdu, "INSUFFICIENT_MANA", "Not enough untapped lands."); return
+        player["hand"].remove(card_id)
+        stack_counter += 1
+        item = {"stack_item_id": f"stk_{stack_counter:04d}", "item_type": "SPELL",
+                "source_id": card_id, "controller_id": player["player_id"], "targets": targets}
+        stack.append(item); consecutive_passes = 0
+        next_seq = next_server_seq()
+        broadcast({"type": "STACK_PUSH", "seq_num": next_seq, "stack_item_id": item["stack_item_id"],
+                   "item_type": item["item_type"], "source": item["source_id"],
+                   "controller": item["controller_id"], "targets": item["targets"]})
+        broadcast_ingame_state()
+        fired = []
+        if card.get("card_type") != "Creature":
+            for perm in player["battlefield"]:
+                if cards.get(perm["id"], {}).get("card_name") == "Monastery Swiftspear":
+                    fired.append(make_trigger(conn, perm["id"], "PROWESS"))
+        # Being targeted triggers Phantasmal Bear.
+        for target_id in targets:
+            owner, perm = find_permanent(target_id)
+            if perm and cards.get(target_id,{}).get("card_name") == "Phantasmal Bear":
+                fired.append(make_trigger(owner, target_id, "SACRIFICE_SELF"))
+        trigger_resume_conn = conn
+        queue_triggers(fired)
+        if not pending_trigger_orders and not pending_trigger_choices: grant_priority(conn)
+
+def handle_activate_ability(conn, pdu):
+    global stack_counter, consecutive_passes
+    with lock:
+        if not validate_priority(conn, pdu): return
+        if not require_fields(conn,pdu,{"source_id":string_id,"ability_index":lambda x:isinstance(x,int) and not isinstance(x,bool) and x>=0,
+                                        "targets":lambda x:string_list(x,True),"cost_payment":lambda x:isinstance(x,dict)}): return
+        source = pdu.get("source_id"); player = players[conn]
+        perm = next((x for x in player["battlefield"] if x.get("id") == source), None)
+        card = cards.get(source, {}); name = card.get("card_name")
+        if not perm or pdu.get("ability_index") != 0:
+            error(conn, pdu, "ILLEGAL_ACTION", "Unknown permanent or ability index."); return
+        supported = {"Llanowar Elves", "Elvish Mystic", "Sol Ring", "Merfolk Looter", "Prodigal Sorcerer", "Royal Assassin", "Millstone", "Rod of Ruin"}
+        if name not in supported or perm.get("tapped"):
+            error(conn, pdu, "ILLEGAL_ACTION", "Ability is unsupported or its source is tapped."); return
+        targets = pdu.get("targets", [])
+        if any(not legal_target(t) for t in targets): error(conn, pdu, "ILLEGAL_TARGET", "Illegal ability target."); return
+        generic_cost = {"Millstone":2, "Rod of Ruin":3}.get(name, 0)
+        if generic_cost and not pay_generic(player, generic_cost): error(conn, pdu, "INSUFFICIENT_MANA", "Cannot pay activation cost."); return
+        perm["tapped"] = True
+        if name in ("Llanowar Elves", "Elvish Mystic", "Sol Ring"):
+            color, amount = ("G", 1) if name != "Sol Ring" else ("C", 2)
+            player["mana_pool"][color] += amount
+            broadcast_ingame_state(); grant_priority(conn); return
+        stack_counter += 1
+        item = {"stack_item_id": f"stk_{stack_counter:04d}", "item_type":"ABILITY", "source_id":source,
+                "controller_id":player["player_id"], "targets":targets, "ability_index":0}
+        stack.append(item); consecutive_passes = 0
+        broadcast({"type":"STACK_PUSH","seq_num":next_server_seq(),"stack_item_id":item["stack_item_id"],
+                   "item_type":"ABILITY","source":source,"controller":player["player_id"],"targets":targets})
+        grant_priority(conn)
+
+def next_server_seq():
+    global server_seq_num
+    server_seq_num += 1
+    return server_seq_num
+
+def make_trigger(controller_conn, source_id, effect, targets=None):
+    global trigger_counter
+    trigger_counter += 1
+    return {"trigger_id":f"trg_{trigger_counter:04d}", "controller_conn":controller_conn,
+            "source_id":source_id, "effect":effect, "targets":targets or []}
+
+def push_trigger(trigger):
+    global stack_counter
+    stack_counter += 1
+    item={"stack_item_id":f"stk_{stack_counter:04d}","item_type":"TRIGGER_ABILITY",
+          "source_id":trigger["source_id"],"controller_id":players[trigger["controller_conn"]]["player_id"],
+          "targets":trigger.get("targets",[]),"trigger_effect":trigger["effect"]}
+    stack.append(item)
+    broadcast({"type":"STACK_PUSH","seq_num":next_server_seq(),"stack_item_id":item["stack_item_id"],
+               "item_type":"TRIGGER_ABILITY","source":item["source_id"],"controller":item["controller_id"],"targets":item["targets"]})
+
+def queue_triggers(fired):
+    """Return True when triggers were pushed or a mandatory decision is pending."""
+    if not fired: return False
+    groups={}
+    for trg in fired: groups.setdefault(trg["controller_conn"],[]).append(trg)
+    # APNAP ordering; this implementation's supported simultaneous events create one group.
+    for controller_conn in ([active_conn,get_other_conn(active_conn)] if active_conn else list(groups)):
+        group=groups.get(controller_conn,[])
+        if len(group)>1:
+            seq=next_server_seq(); pending_trigger_orders[controller_conn]={"seq":seq,"triggers":group}
+            send_pdu(controller_conn,{"type":"TRIGGER_ORDER","seq_num":seq,"player_id":players[controller_conn]["player_id"],
+                                      "trigger_ids":[x["trigger_id"] for x in group]})
+        elif group: push_trigger(group[0])
+    return True
+
+def request_trigger_target(trigger, legal_targets):
+    if not legal_targets: return False
+    conn=trigger["controller_conn"]; seq=next_server_seq()
+    pending_trigger_choices[conn]={"seq":seq,"trigger":trigger,"legal_targets":legal_targets}
+    send_pdu(conn,{"type":"TRIGGER_CHOICE","seq_num":seq,"trigger_id":trigger["trigger_id"],
+                   "source_id":trigger["source_id"],"effect_summary":trigger["effect"],
+                   "requires_target":True,"legal_targets":legal_targets})
+    return True
+
+def handle_trigger_order_response(conn,pdu):
+    pending=pending_trigger_orders.get(conn)
+    if not pending or pdu.get("seq_num")!=pending["seq"]:
+        error(conn,pdu,"TRIGGER_ORDER_INVALID","No matching trigger-order request."); return
+    ids=pdu.get("ordered_trigger_ids",[]); by_id={x["trigger_id"]:x for x in pending["triggers"]}
+    if not string_list(ids,True): error(conn,pdu,"TRIGGER_ORDER_INVALID","ordered_trigger_ids must be a unique string list."); return
+    if len(ids)!=len(by_id) or set(ids)!=set(by_id): error(conn,pdu,"TRIGGER_ORDER_INVALID","Order must contain each trigger exactly once."); return
+    del pending_trigger_orders[conn]
+    for tid in ids: push_trigger(by_id[tid])
+    if not pending_trigger_orders and not pending_trigger_choices: grant_priority(trigger_resume_conn or active_conn)
+
+def handle_trigger_choice_response(conn,pdu):
+    pending=pending_trigger_choices.get(conn)
+    if not pending or pdu.get("seq_num")!=pending["seq"] or pdu.get("trigger_id")!=pending["trigger"]["trigger_id"]:
+        error(conn,pdu,"TRIGGER_CHOICE_INVALID","No matching trigger-choice request."); return
+    if not isinstance(pdu.get("accept"),bool): error(conn,pdu,"TRIGGER_CHOICE_INVALID","accept must be boolean."); return
+    chosen=pdu.get("chosen_target")
+    if not pdu.get("accept") or chosen not in pending["legal_targets"]:
+        error(conn,pdu,"TRIGGER_CHOICE_INVALID","A required legal target must be accepted."); return
+    trigger=pending["trigger"]; trigger["targets"]=[chosen]; del pending_trigger_choices[conn]; push_trigger(trigger)
+    if not pending_trigger_orders and not pending_trigger_choices: grant_priority(trigger_resume_conn or active_conn)
+
+def find_permanent(target):
+    for owner_conn, p in players.items():
+        for perm in p["battlefield"]:
+            if perm.get("id") == target:
+                return owner_conn, perm
+    return None, None
+
+def deal_damage(target, amount):
+    for p in players.values():
+        if p["player_id"] == target:
+            p["life"] -= amount; return
+    _, perm = find_permanent(target)
+    if perm is not None: perm["damage"] = perm.get("damage", 0) + amount
+
+def destroy_dead_creatures():
+    died = []
+    for p in players.values():
+        for perm in list(p["battlefield"]):
+            info = cards.get(perm["id"], {})
+            if info.get("card_type") == "Creature" and perm.get("damage", 0) >= int(info.get("toughness") or 0) + perm.get("toughness_bonus", 0):
+                p["battlefield"].remove(perm); p["graveyard"].append(perm["id"])
+                died.append(perm["id"])
+    return died
+
+def resolve_stack_top():
+    global consecutive_passes, trigger_resume_conn
+    item = stack.pop(); card = cards[item["source_id"]]; controller = next(p for p in players.values() if p["player_id"] == item["controller_id"])
+    name = card.get("card_name")
+    result = "RESOLVED"; changes = []
+    target = item["targets"][0] if item["targets"] else None
+    if item["item_type"] == "TRIGGER_ABILITY":
+        effect=item.get("trigger_effect")
+        if effect=="PROWESS":
+            _,perm=find_permanent(item["source_id"])
+            if perm: perm["power_bonus"]=perm.get("power_bonus",0)+1; perm["toughness_bonus"]=perm.get("toughness_bonus",0)+1
+            else: result="FIZZLE"
+        elif effect=="SACRIFICE_SELF":
+            owner,perm=find_permanent(item["source_id"])
+            if perm: players[owner]["battlefield"].remove(perm); players[owner]["graveyard"].append(item["source_id"]); changes.append({"change_type":"SACRIFICE","target":item["source_id"]})
+        elif effect=="GRAY_MERCHANT":
+            devotion=sum(int(cards.get(p["id"],{}).get("cost",{}).get("B") or 0) for p in controller["battlefield"])
+            opponent=players[get_other_conn(next(c for c,x in players.items() if x is controller))]; opponent["life"]-=devotion; controller["life"]+=devotion
+            changes += [{"change_type":"DAMAGE","target":opponent["player_id"],"amount":devotion},{"change_type":"LIFE_GAIN","target":controller["player_id"],"amount":devotion}]
+        elif effect=="GRAVEDIGGER":
+            target=item["targets"][0] if item["targets"] else None
+            if target in controller["graveyard"]: controller["graveyard"].remove(target); controller["hand"].append(target); changes.append({"change_type":"RETURN_TO_HAND","target":target})
+            else: result="FIZZLE"
+        elif effect=="GOBLIN_GUIDE":
+            opponent=players[get_other_conn(next(c for c,x in players.items() if x is controller))]
+            if opponent["library"] and cards.get(opponent["library"][-1],{}).get("card_type")=="Land": opponent["hand"].append(opponent["library"].pop())
+    elif item["item_type"] == "ABILITY":
+        if name in ("Prodigal Sorcerer", "Rod of Ruin") and target:
+            deal_damage(target, 1); changes.append({"change_type":"DAMAGE","target":target,"amount":1})
+        elif name == "Royal Assassin" and target:
+            owner, perm = find_permanent(target)
+            if perm and perm.get("tapped") and cards.get(target,{}).get("card_type") == "Creature":
+                players[owner]["battlefield"].remove(perm); players[owner]["graveyard"].append(target); changes.append({"change_type":"DESTROY","target":target})
+            else: result = "FIZZLE"
+        elif name == "Millstone" and target:
+            victim = next((p for p in players.values() if p["player_id"] == target), None)
+            if victim:
+                milled=[]
+                for _ in range(min(2,len(victim["library"]))): milled.append(victim["library"].pop())
+                victim["graveyard"].extend(milled); changes.append({"change_type":"MILL","target":target,"cards":milled})
+            else: result="FIZZLE"
+        elif name == "Merfolk Looter":
+            if controller["library"]: controller["hand"].append(controller["library"].pop())
+            # Discard choice is simplified to the last card; client-side choice would require another RFC PDU.
+            if controller["hand"]: controller["graveyard"].append(controller["hand"].pop())
+    elif name == "Counterspell" and target:
+        victim = next((x for x in reversed(stack) if x["stack_item_id"] == target), None)
+        if victim:
+            stack.remove(victim); next(p for p in players.values() if p["player_id"] == victim["controller_id"])["graveyard"].append(victim["source_id"])
+            changes.append({"change_type":"COUNTER", "target":target})
+    elif name in ("Lightning Bolt", "Lava Spike") and target: deal_damage(target, 3); changes.append({"change_type":"DAMAGE","target":target,"amount":3})
+    elif name == "Shock" and target: deal_damage(target, 2); changes.append({"change_type":"DAMAGE","target":target,"amount":2})
+    elif name == "Searing Spear" and target: deal_damage(target, 3); changes.append({"change_type":"DAMAGE","target":target,"amount":3})
+    elif name == "Flame Slash" and target: deal_damage(target, 4); changes.append({"change_type":"DAMAGE","target":target,"amount":4})
+    elif name == "Giant Growth" and target:
+        _, perm = find_permanent(target)
+        if perm: perm["power_bonus"] = perm.get("power_bonus", 0) + 3; perm["toughness_bonus"] = perm.get("toughness_bonus", 0) + 3
+        else: result = "FIZZLE"
+    elif card.get("card_type") == "Creature":
+        controller["battlefield"].append({"id": item["source_id"], "tapped": False, "damage": 0, "summoning_turn": turn_number})
+    controller["graveyard"].append(item["source_id"]) if card.get("card_type") in ("Instant", "Sorcery") else None
+    for dead in destroy_dead_creatures(): changes.append({"change_type":"DESTROY","target":dead})
+    broadcast({"type": "STACK_RESOLVE", "seq_num": next_server_seq(), "stack_item_id": item["stack_item_id"], "result": result, "state_changes": changes})
+    consecutive_passes = 0; broadcast_ingame_state()
+    if game_phase == "IN_GAME":
+        fired=[]
+        if item["item_type"]=="SPELL" and card.get("card_type")=="Creature":
+            new_conn=next(c for c,x in players.items() if x is controller)
+            if name=="Gray Merchant of Asphodel": fired.append(make_trigger(new_conn,item["source_id"],"GRAY_MERCHANT"))
+            elif name=="Gravedigger":
+                legal=[cid for cid in controller["graveyard"] if cards.get(cid,{}).get("card_type")=="Creature"]
+                trg=make_trigger(new_conn,item["source_id"],"GRAVEDIGGER")
+                if request_trigger_target(trg,legal): return
+        trigger_resume_conn = active_conn
+        queue_triggers(fired)
+        if not pending_trigger_orders and not pending_trigger_choices: grant_priority(active_conn)
+
+def handle_discard(conn, pdu):
+    with lock:
+        player = players.get(conn); ids = pdu.get("card_ids")
+        if not string_list(ids,True): error(conn,pdu,"ILLEGAL_ACTION","card_ids must be a unique string list."); return
+        if game_phase != "IN_GAME" or current_step != "CLEANUP" or conn != active_conn:
+            error(conn, pdu, "WRONG_PHASE", "DISCARD is only accepted from the active player in CLEANUP."); return
+        expected = player.get("last_state_seq_num")
+        if pdu.get("seq_num") != expected: error(conn, pdu, "STALE_ACTION", f"Expected seq_num {expected}."); return
+        if not isinstance(ids, list) or len(ids) != len(player["hand"]) - 7 or any(i not in player["hand"] for i in ids) or len(ids) != len(set(ids)):
+            error(conn, pdu, "ILLEGAL_ACTION", "Discard exactly the excess cards from your hand."); return
+        for i in ids: player["hand"].remove(i); player["graveyard"].append(i)
+        finish_cleanup_step()
+
+def creature_stats(perm):
+    info = cards.get(perm["id"], {})
+    return int(info.get("power") or 0) + perm.get("power_bonus", 0), int(info.get("toughness") or 0) + perm.get("toughness_bonus", 0)
+
+def handle_declare_attackers(conn, pdu):
+    global attackers, trigger_resume_conn
+    with lock:
+        if current_step != "DECLARE_ATTACKERS" or conn != active_conn:
+            if current_step == "DECLARE_ATTACKERS" and conn != active_conn: error(conn, pdu, "ILLEGAL_ACTION", "Only active player declares attackers.")
+            return
+        if pdu.get("seq_num") != combat_request_seq:
+            error(conn, pdu, "STALE_ACTION", f"Expected phase token {combat_request_seq}."); return
+        declarations = pdu.get("attackers", [])
+        if not isinstance(declarations, list) or any(not isinstance(x,dict) or not string_id(x.get("creature_id")) or not string_id(x.get("target")) for x in declarations):
+            error(conn, pdu, "ILLEGAL_ACTION", "attackers must be a list."); return
+        ids = [x.get("creature_id") if isinstance(x, dict) else x for x in declarations]
+        opponent_id = players[get_other_conn(conn)]["player_id"]
+        if len(ids) != len(set(ids)) or any(isinstance(x, dict) and x.get("target") != opponent_id for x in declarations):
+            error(conn, pdu, "ILLEGAL_ACTION", "attackers must be a unique list."); return
+        by_id = {x["id"]: x for x in players[conn]["battlefield"]}
+        for cid in ids:
+            perm = by_id.get(cid); info = cards.get(cid, {})
+            haste = "haste" in str(info.get("effect", "")).lower()
+            if not perm or info.get("card_type") != "Creature" or perm.get("tapped") or (perm.get("summoning_turn") == turn_number and not haste):
+                error(conn, pdu, "ILLEGAL_ACTION", f"{cid} cannot attack."); return
+        attackers = ids
+        for cid in ids: by_id[cid]["tapped"] = True
+        if not attackers:
+            transition_to("END_OF_COMBAT")
+        else:
+            # Attackers are locked in; AP receives priority before blockers.
+            broadcast_ingame_state()
+            fired=[make_trigger(conn,cid,"GOBLIN_GUIDE") for cid in attackers if cards.get(cid,{}).get("card_name")=="Goblin Guide"]
+            trigger_resume_conn=active_conn; queue_triggers(fired)
+            if not pending_trigger_orders and not pending_trigger_choices: open_priority_window()
+
+def handle_declare_blockers(conn, pdu):
+    global blockers
+    with lock:
+        if current_step != "DECLARE_BLOCKERS" or conn == active_conn: return
+        if pdu.get("seq_num") != combat_request_seq:
+            error(conn, pdu, "STALE_ACTION", f"Expected phase token {combat_request_seq}."); return
+        raw = pdu.get("blockers", {})
+        if not isinstance(raw,list) or any(not isinstance(x,dict) or not string_id(x.get("creature_id")) or not string_id(x.get("blocking_id")) for x in raw):
+            error(conn,pdu,"ILLEGAL_ACTION","blockers must contain creature_id/blocking_id string objects."); return
+        # RFC: [{creature_id: blocker, blocking_id: attacker}].
+        pairs = raw if isinstance(raw, list) else [{"creature_id": b, "blocking_id": a} for b, a in raw.items()] if isinstance(raw, dict) else []
+        own = {x["id"]: x for x in players[conn]["battlefield"]}
+        seen = set(); parsed = {}
+        for pair in pairs:
+            b, a = pair.get("creature_id", pair.get("blocker_id")), pair.get("blocking_id", pair.get("attacker_id"))
+            if b in seen or b not in own or cards.get(b, {}).get("card_type") != "Creature" or own[b].get("tapped") or a not in attackers:
+                error(conn, pdu, "ILLEGAL_ACTION", "Illegal blocker assignment."); return
+            seen.add(b); parsed.setdefault(a, []).append(b)
+        blockers = parsed
+        # Blockers are locked in; AP receives priority before damage ordering.
+        broadcast_ingame_state()
+        open_priority_window()
+
+def handle_damage_order(conn, pdu):
+    global damage_orders
+    with lock:
+        if current_step != "ASSIGN_DAMAGE_ORDER" or conn != active_conn: return
+        if pdu.get("seq_num") != combat_request_seq:
+            error(conn, pdu, "STALE_ACTION", f"Expected phase token {combat_request_seq}."); return
+        attacker = pdu.get("attacker_id")
+        order = pdu.get("blocker_order")
+        if not string_id(attacker) or not string_list(order,True): error(conn,pdu,"ILLEGAL_ACTION","Invalid attacker_id or blocker_order."); return
+        if attacker not in blockers or not isinstance(order, list) or set(order) != set(blockers[attacker]):
+            error(conn, pdu, "ILLEGAL_ACTION", "blocker_order must list every blocker for attacker_id exactly once."); return
+        damage_orders[attacker] = order
+        required = {a for a, bs in blockers.items() if len(bs) > 1}
+        if required.issubset(damage_orders): begin_combat_damage()
+        else: grant_priority(active_conn)
+
+def has_first_strike(card_id):
+    return "first strike" in str(cards.get(card_id, {}).get("effect", "")).lower()
+
+def begin_combat_damage():
+    combatants = attackers + [b for values in blockers.values() for b in values]
+    if any(has_first_strike(x) for x in combatants):
+        transition_to("FIRST_STRIKE_DAMAGE")
+        resolve_combat_damage(first_strike=True)
+    else:
+        transition_to("COMBAT_DAMAGE")
+
+def transition_to(step):
+    global current_step, combat_request_seq
+    old = current_step; current_step = step
+    seq = next_server_seq()
+    if step in ("DECLARE_ATTACKERS", "DECLARE_BLOCKERS", "ASSIGN_DAMAGE_ORDER"):
+        combat_request_seq = seq
+    broadcast({"type": "PHASE_TRANSITION", "seq_num": seq, "from_phase": old,
+               "to_phase": step, "active_player": players[active_conn]["player_id"], "turn": turn_number})
+    enter_step(step)
+
+def resolve_combat_damage(first_strike=False):
+    defender = get_other_conn(active_conn); assignments = []
+    for aid in attackers:
+        _, aper = find_permanent(aid)
+        if not aper: continue
+        attacker_strikes = has_first_strike(aid) == first_strike
+        apower, _ = creature_stats(aper); bs = blockers.get(aid, [])
+        if not bs:
+            if attacker_strikes:
+                players[defender]["life"] -= apower; assignments.append({"source": aid, "target": players[defender]["player_id"], "amount": apower})
+            continue
+        remaining = apower
+        for bid in damage_orders.get(aid, bs) if attacker_strikes else []:
+            _, bper = find_permanent(bid)
+            if not bper: continue
+            _, btough = creature_stats(bper); lethal = max(0, btough - bper.get("damage", 0)); amount = min(remaining, lethal)
+            bper["damage"] = bper.get("damage", 0) + amount; remaining -= amount
+            assignments.append({"source": aid, "target": bid, "amount": amount})
+        striking_blockers = [b for b in bs if has_first_strike(b) == first_strike]
+        retaliation = sum(creature_stats(find_permanent(b)[1])[0] for b in striking_blockers if find_permanent(b)[1])
+        aper["damage"] = aper.get("damage", 0) + retaliation
+        assignments.extend({"source": b, "target": aid, "amount": creature_stats(find_permanent(b)[1])[0]} for b in striking_blockers if find_permanent(b)[1])
+    died = destroy_dead_creatures()
+    broadcast({"type": "COMBAT_DAMAGE_RESULT", "seq_num": next_server_seq(), "damage_events": assignments,
+               "life_totals": {p["player_id"]: p["life"] for p in players.values()}, "creatures_died": died})
+    broadcast_ingame_state()
+    if game_phase != "IN_GAME": return
+    if first_strike:
+        # State-based actions occur, then players receive priority before normal damage.
+        open_priority_window()
+    else:
+        transition_to("END_OF_COMBAT")
+
 def handle_client(conn, addr):
     print(f"[S] Handling client {addr}")
     try:
         while True:
-            pdu = recv_pdu(conn)
+            try:
+                pdu = recv_pdu(conn)
+            except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                send_pdu(conn, {"type": "ERROR", "seq_num": 0, "code": "INVALID_JSON", "message": str(exc)})
+                if str(exc) == "INVALID_LENGTH": break  # stream boundary cannot be recovered safely
+                continue
             if pdu is None:
                 print(f"[S] Client {addr} disconnected")
                 # If disconnected during an active game, remaining player wins
@@ -942,6 +1487,22 @@ def handle_client(conn, addr):
                 handle_priority_pass(conn, pdu)
             elif msg_type == "PLAY_LAND":
                 handle_play_land(conn, pdu)
+            elif msg_type == "CAST_SPELL":
+                handle_cast_spell(conn, pdu)
+            elif msg_type == "ACTIVATE_ABILITY":
+                handle_activate_ability(conn, pdu)
+            elif msg_type == "DISCARD":
+                handle_discard(conn, pdu)
+            elif msg_type == "DECLARE_ATTACKERS":
+                handle_declare_attackers(conn, pdu)
+            elif msg_type == "DECLARE_BLOCKERS":
+                handle_declare_blockers(conn, pdu)
+            elif msg_type == "ASSIGN_DAMAGE_ORDER":
+                handle_damage_order(conn, pdu)
+            elif msg_type == "TRIGGER_ORDER_RESPONSE":
+                handle_trigger_order_response(conn, pdu)
+            elif msg_type == "TRIGGER_CHOICE_RESPONSE":
+                handle_trigger_choice_response(conn, pdu)
             elif msg_type == "CONCEDE":
                 handle_concede(conn, pdu)
             else:
@@ -951,6 +1512,8 @@ def handle_client(conn, addr):
                     "code": "UNKNOWN_TYPE",
                     "message": f"Unhandled type: {msg_type}"
                 })
+    except OSError:
+        handle_disconnect(conn)
     finally:
         conn.close()
         with lock:

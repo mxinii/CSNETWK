@@ -4,16 +4,30 @@ import struct
 import time
 import argparse
 import datetime
+import threading
+from protocol import MAX_PDU_SIZE, encode_pdu, recv_pdu as wire_recv_pdu
+from input_validation import choice, csv_ids, nonempty, pairs, prompt_until
 
 HOST = "127.0.0.1"
 PORT = 4444
+
+def port_number(value):
+    value=int(value)
+    if not 1 <= value <= 65535: raise argparse.ArgumentTypeError("port must be 1-65535")
+    return value
 
 # --- verbose mode setup ---
 parser = argparse.ArgumentParser(description="MTGNP Game Client")
 parser.add_argument("-v", "--verbose", action="store_true",
                      help="Print every PDU sent/received to the console")
+parser.add_argument("--host", default=HOST, help="Server address (default: 127.0.0.1)")
+parser.add_argument("--port", type=port_number, default=PORT)
 args = parser.parse_args()
 VERBOSE = args.verbose
+HOST, PORT = args.host, args.port
+send_lock = threading.Lock()
+stop_event = threading.Event()
+last_pong = time.monotonic()
 
 def log_pdu(direction: str, pdu: dict):
     """direction: 'SEND' (C->S) or 'RECV' (S->C)."""
@@ -33,9 +47,8 @@ deck_list = list(cards.keys())[:50]
 
 def send_pdu(sock, pdu: dict):
     log_pdu("SEND", pdu)
-    payload = json.dumps(pdu).encode("utf-8")
-    length_prefix = struct.pack(">I", len(payload))
-    sock.sendall(length_prefix + payload)
+    with send_lock:
+        sock.sendall(encode_pdu(pdu))
 
 def recv_exact(sock, n):
     data = b""
@@ -47,14 +60,8 @@ def recv_exact(sock, n):
     return data
 
 def recv_pdu(sock):
-    length_bytes = recv_exact(sock, 4)
-    if length_bytes is None:
-        return None
-    length = struct.unpack(">I", length_bytes)[0]
-    payload = recv_exact(sock, length)
-    if payload is None:
-        return None
-    pdu = json.loads(payload.decode("utf-8"))
+    pdu = wire_recv_pdu(sock)
+    if pdu is None: return None
     log_pdu("RECV", pdu)
     return pdu
 
@@ -62,7 +69,7 @@ client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 client_socket.connect((HOST, PORT))
 print(f"[C] Connected to server at {HOST}:{PORT}")
 
-player_id = input("Enter player ID (player_1 or player_2): ")
+player_id = prompt_until("Enter a unique player ID: ", lambda x: nonempty(x,"player ID",64))
 player_ready = {
     "type": "PLAYER_READY",
     "seq_num": 1,
@@ -74,7 +81,26 @@ player_ready = {
 send_pdu(client_socket, player_ready)
 print("[C] Ready state sent. Waiting for server state update...\n")
 
+def heartbeat():
+    """Keep-alive runs independently so interactive prompts cannot suppress PINGs."""
+    seq = 1
+    global last_pong
+    while not stop_event.wait(30):
+        seq += 1
+        sent_at = time.monotonic()
+        send_pdu(client_socket, {"type": "PING", "seq_num": seq, "timestamp": int(time.time() * 1000)})
+        deadline = sent_at + 10
+        while last_pong < sent_at and time.monotonic() < deadline and not stop_event.wait(.2): pass
+        if last_pong < sent_at:
+            print("[C] PONG timeout; closing connection.")
+            try: client_socket.shutdown(socket.SHUT_RDWR)
+            except OSError: pass
+            return
+
+threading.Thread(target=heartbeat, daemon=True).start()
+
 mulligan_count = 0  # tracks how many times we've mulliganed, used to size cards_to_bottom
+latest_state = {}
 
 # main event loop
 while True:
@@ -88,6 +114,7 @@ while True:
 
     if msg_type == "GAME_STATE_UPDATE":
         state = reply.get("state", {})
+        latest_state = state
         phase = state.get("phase")
 
         print(f"\n=== {state.get('phase')} ===")
@@ -109,16 +136,20 @@ while True:
 
             # Prompt for this player's mulligan decision and send MULLIGAN_CHOICE.
             # seq_num echoes this GAME_STATE_UPDATE's seq_num, per RFC 5.4.
-            choice = input("Keep this hand? (y = keep / n = mulligan): ").strip().lower()
+            decision = prompt_until("Keep this hand? (y = keep / n = mulligan): ",
+                                    lambda x: choice(x,("y","n"),"mulligan choice"))
 
-            if choice == "y":
+            if decision == "y":
                 cards_to_bottom = []
                 if mulligan_count > 0:
                     print(f"You mulliganed {mulligan_count} time(s); "
                           f"choose {mulligan_count} card(s) to bottom from your hand.")
+                    available=list(state["hand"])
                     for i in range(mulligan_count):
-                        card = input(f"  Card {i+1} to bottom: ").strip()
+                        card = prompt_until(f"  Card {i+1} to bottom: ",
+                            lambda x, available=available: nonempty(x,"card ID") if x.strip() in available else (_ for _ in ()).throw(ValueError("card must be a remaining card in your hand")))
                         cards_to_bottom.append(card)
+                        available.remove(card)
 
                 send_pdu(client_socket, {
                     "type": "MULLIGAN_CHOICE",
@@ -146,9 +177,12 @@ while True:
                 excess = len(hand) - 7
                 print(f"\n[CLEANUP] Your hand size exceeds 7! You must discard {excess} card(s).")
                 discard_list = []
+                available=list(hand)
                 for i in range(excess):
-                    card = input(f"  Card {i+1} ID to discard: ").strip()
+                    card = prompt_until(f"  Card {i+1} ID to discard: ",
+                        lambda x, available=available: nonempty(x,"card ID") if x.strip() in available else (_ for _ in ()).throw(ValueError("card must be a remaining card in your hand")))
                     discard_list.append(card)
+                    available.remove(card)
 
                 send_pdu(client_socket, {
                     "type": "DISCARD",
@@ -159,13 +193,35 @@ while True:
     elif msg_type == "PRIORITY_GRANT":
         # NEW: Basic Priority Passing (RFC Section 8)
         print(f"\n[PRIORITY] You have priority (seq_num: {reply.get('seq_num')}).")
-        action = input("Action? (p = pass priority / c = concede): ").strip().lower()
+        step = reply.get("step")
+        action = prompt_until("Action? p=pass, l=land, s=spell, x=ability, c=concede: ",
+                              lambda x: choice(x,("p","l","s","x","c"),"action"))
         
         if action == "c":
             send_pdu(client_socket, {
                 "type": "CONCEDE",
                 "seq_num": reply.get("seq_num")
             })
+        elif action == "l":
+            hand=latest_state.get("hand",[])
+            land_id=prompt_until("Land card ID: ",lambda x: nonempty(x,"land ID") if x.strip() in hand and cards.get(x.strip(),{}).get("card_type")=="Land" else (_ for _ in ()).throw(ValueError("choose a Land from your displayed hand")))
+            send_pdu(client_socket, {"type": "PLAY_LAND", "seq_num": reply["seq_num"],
+                                     "card_id": land_id})
+        elif action == "s":
+            hand=latest_state.get("hand",[])
+            card_id = prompt_until("Spell card ID: ",lambda x: nonempty(x,"spell ID") if x.strip() in hand and cards.get(x.strip(),{}).get("card_type")!="Land" else (_ for _ in ()).throw(ValueError("choose a nonland card from your displayed hand")))
+            targets = prompt_until("Target IDs (comma-separated, blank for none): ",lambda x:csv_ids(x,"target IDs"))
+            cost=cards[card_id].get("cost",{}); payment={k:int(cost.get(k) or 0) for k in "WUBRG"}
+            payment["X"]=int(cost.get("Generic") or 0)
+            send_pdu(client_socket, {"type": "CAST_SPELL", "seq_num": reply["seq_num"], "card_id": card_id,
+                                     "targets": targets, "mana_payment":payment})
+        elif action == "x":
+            own=[x.get("id") for x in latest_state.get("battlefield",{}).get(player_id,[])]
+            source = prompt_until("Permanent/source ID: ",lambda x:nonempty(x,"source ID") if x.strip() in own else (_ for _ in ()).throw(ValueError("choose a permanent you control")))
+            targets = prompt_until("Target IDs (comma-separated, blank for none): ",lambda x:csv_ids(x,"target IDs"))
+            send_pdu(client_socket, {"type":"ACTIVATE_ABILITY", "seq_num":reply["seq_num"],
+                                     "source_id":source, "ability_index":0, "targets":targets,
+                                     "cost_payment":{"tap":True,"mana":{}}})
         else:
             send_pdu(client_socket, {
                 "type": "PRIORITY_PASS",
@@ -175,6 +231,30 @@ while True:
     elif msg_type == "PHASE_TRANSITION":
         print(f"\n=== PHASE_TRANSITION: {reply.get('from_phase')} -> {reply.get('to_phase')} "
               f"(turn {reply.get('turn')}, active: {reply.get('active_player')}) ===")
+        to_step = reply.get("to_phase"); is_active = reply.get("active_player") == player_id
+        if to_step == "DECLARE_ATTACKERS" and is_active:
+            opponents=[x for x in latest_state.get("life_totals",{}) if x!=player_id]
+            opponent = prompt_until("Defending player ID: ",lambda x:nonempty(x,"player ID") if x.strip() in opponents else (_ for _ in ()).throw(ValueError("choose the opposing player ID")))
+            own={x.get("id"):x for x in latest_state.get("battlefield",{}).get(player_id,[])}
+            ids = prompt_until("Attacker IDs (comma-separated, blank for none): ",lambda x:csv_ids(x,"attacker IDs"))
+            while any(cid not in own or cards.get(cid,{}).get("card_type")!="Creature" or own[cid].get("tapped") for cid in ids):
+                print("Invalid input: choose unique, untapped creatures you control.")
+                ids=prompt_until("Attacker IDs: ",lambda x:csv_ids(x,"attacker IDs"))
+            send_pdu(client_socket,{"type":"DECLARE_ATTACKERS","seq_num":reply["seq_num"],
+                                    "attackers":[{"creature_id":x,"target":opponent} for x in ids]})
+        elif to_step == "DECLARE_BLOCKERS" and not is_active:
+            own={x.get("id"):x for x in latest_state.get("battlefield",{}).get(player_id,[])}
+            parsed=prompt_until("Blocks as blocker:attacker pairs (comma-separated, blank for none): ",lambda x:pairs(x,"block"))
+            while any(blocker not in own or cards.get(blocker,{}).get("card_type")!="Creature" or own[blocker].get("tapped") for blocker,_ in parsed):
+                print("Invalid input: each blocker must be an untapped creature you control.")
+                parsed=prompt_until("Blocks: ",lambda x:pairs(x,"block"))
+            send_pdu(client_socket,{"type":"DECLARE_BLOCKERS","seq_num":reply["seq_num"],
+                                    "blockers":[{"creature_id":b,"blocking_id":a} for b,a in parsed]})
+        elif to_step == "ASSIGN_DAMAGE_ORDER" and is_active:
+            attacker=prompt_until("Multiply-blocked attacker ID: ",lambda x:nonempty(x,"attacker ID"))
+            order=prompt_until("Blocker order (comma-separated): ",lambda x:csv_ids(x,"blocker order",False))
+            send_pdu(client_socket,{"type":"ASSIGN_DAMAGE_ORDER","seq_num":reply["seq_num"],
+                                    "attacker_id":attacker,"blocker_order":order})
 
     elif msg_type == "GAME_OVER":
         # NEW: Game Over Notification (RFC Section 6.6)
@@ -188,7 +268,24 @@ while True:
         mulligan_count = 0
 
     elif msg_type == "PONG":
+        last_pong = time.monotonic()
         print("[C] Received PONG")
+
+    elif msg_type == "TRIGGER_ORDER":
+        offered = reply.get("trigger_ids", [])
+        print("Simultaneous triggers:", offered)
+        order = prompt_until("Trigger IDs in desired order (comma-separated): ",
+            lambda x: csv_ids(x,"trigger IDs",False) if set(csv_ids(x,"trigger IDs",False))==set(offered) and len(csv_ids(x,"trigger IDs",False))==len(offered) else (_ for _ in ()).throw(ValueError("order must contain every offered trigger exactly once")))
+        send_pdu(client_socket, {"type":"TRIGGER_ORDER_RESPONSE", "seq_num":reply["seq_num"], "ordered_trigger_ids":order})
+
+    elif msg_type == "TRIGGER_CHOICE":
+        accept = prompt_until("Use trigger? (y/n): ",lambda x:choice(x,("y","n"),"trigger choice"))=="y"
+        legal=reply.get("legal_targets",[]); required=reply.get("requires_target",False)
+        target = None
+        if accept and required:
+            target=prompt_until("Chosen target: ",lambda x:nonempty(x,"target") if x.strip() in legal else (_ for _ in ()).throw(ValueError("choose one of the listed legal targets")))
+        send_pdu(client_socket, {"type":"TRIGGER_CHOICE_RESPONSE", "seq_num":reply["seq_num"],
+                                 "trigger_id":reply.get("trigger_id"), "accept":accept, "chosen_target":target})
 
     elif msg_type == "ERROR":
         print(f"[ERROR] {reply['code']}: {reply['message']}")
@@ -196,5 +293,6 @@ while True:
     else:
         print(f"[C] Received: {reply}")
 
+stop_event.set()
 client_socket.close()
 print("[C] Socket closed")
