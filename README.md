@@ -45,25 +45,37 @@ Lightning Bolt, Shock, Lava Spike, Flame Slash, Searing Spear, Giant Growth and 
 
 ## Work Distribution Matrix
 
-Replace the placeholders truthfully before submission; the course rubric requires each group member's actual contribution.
+Legend:
+✅: full contribution
+🟰: partial contribution
+❎: no contribution
 
-| Task / Feature | Member 1 | Member 2 | Member 3 | Member 4 |
+| Task / Feature | Ileto, Miguel | Lee, Maria Isabella | Varela, Maxine | Yana, Jeon |
 |---|---|---|---|---|
-| TCP Server: connection handling, framing, dispatch | TBD | TBD | TBD | TBD |
-| Game lifecycle: LOBBY, GAME_SETUP, MULLIGAN logic | TBD | TBD | TBD | TBD |
-| Turn & phase engine (all phases/steps, transitions) | TBD | TBD | TBD | TBD |
-| Priority & Stack logic, spell/ability resolution | TBD | TBD | TBD | TBD |
-| Combat system (attackers, blockers, damage) | TBD | TBD | TBD | TBD |
-| Client implementation & state rendering | TBD | TBD | TBD | TBD |
-| PDU serialisation/deserialisation (all 25 PDU types) | TBD | TBD | TBD | TBD |
-| Error handling, PING/PONG heartbeat, disconnect logic | TBD | TBD | TBD | TBD |
-| Verbose mode (client + server PDU logging, toggle on/off) | TBD | TBD | TBD | TBD |
-| Testing & interoperability | TBD | TBD | TBD | TBD |
-| README / documentation / AI disclosure | TBD | TBD | TBD | TBD |
+| TCP Server: connection handling, framing, dispatch | 🟰 | ❎ | ✅ | 🟰 |
+| Game lifecycle: LOBBY, GAME_SETUP, MULLIGAN logic | ❎ | ✅ | 🟰 | ✅ |
+| Turn & phase engine (all phases/steps, transitions) | ❎ | 🟰 | ✅ | ✅ |
+| Priority & Stack logic, spell/ability resolution | ❎ | 🟰 | ✅ | 🟰 |
+| Combat system (attackers, blockers, damage) | ❎ | 🟰 | 🟰 | 🟰 |
+| Client implementation & state rendering | ❎ | ✅ | 🟰 | ✅ |
+| PDU serialisation/deserialisation (all 25 PDU types) | ❎ | 🟰 | 🟰 | 🟰 |
+| Error handling, PING/PONG heartbeat, disconnect logic | ❎ | 🟰 | ✅ | 🟰 |
+| Verbose mode (client + server PDU logging, toggle on/off) | ❎ | ✅ | 🟰 | ❎ |
+| Testing & interoperability | ❎ | ✅ | ❎ | ✅ |
+| README / documentation / AI disclosure | ❎ | ✅ | ✅ | ✅ |
 
 ## AI Usage
 
 The following were used:
 - ChatGPT:
+    To understand each part of specs
+    Asked help to generate code
 - Claude:
+    To understand each part of specs
+    Asked help to generate code
+    Asked help to check whether code meets specs
 - Gemini:
+    To understand each part of specs
+    Asked help to generate code
+    Asked help to check whether code meets specs
+    To help understand some parts of the code
