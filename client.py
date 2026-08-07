@@ -455,7 +455,7 @@ while True:
                                     "attacker_id":attacker,"blocker_order":order})
 
     elif msg_type == "GAME_OVER":
-        # NEW: Game Over Notification (RFC Section 6.6)
+        # game Over Notification (RFC Section 6.6)
         print(f"\n==========================================")
         print(f" GAME OVER!")
         print(f" Winner: {reply.get('winner_id')}")

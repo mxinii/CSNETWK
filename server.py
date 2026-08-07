@@ -18,8 +18,7 @@ def port_number(value):
 
 # --- verbose mode setup ---
 # Parse --verbose / -v at startup. VERBOSE is a module-level flag that every
-# send_pdu/recv_pdu call checks before printing. Toggled only via the CLI flag
-# for now (RFC just requires it be toggleable at runtime via startup argument).
+# send_pdu/recv_pdu call checks before printing
 parser = argparse.ArgumentParser(description="MTGNP Game Server")
 parser.add_argument("-v", "--verbose", action="store_true",
                      help="Print every PDU sent/received to the console")
