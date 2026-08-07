@@ -141,9 +141,10 @@ def broadcast_lobby_status():
     with lock:
         ready_ids = [p["player_id"] for p in players.values() if p.get("ready", False)]
         snapshot_conns = [conn for conn, info in players.items() if info.get("connected", True)]
-    # Player IDs are user-selected names, so they cannot be compared with the
-    # old hard-coded placeholders.  Report only the unoccupied lobby slots.
-    waiting_for = [f"player_{slot}" for slot in range(len(ready_ids) + 1, 3)]
+    # Player IDs are user-selected names
+    # Report only the unoccupied lobby slots.
+    slots_needed = 2 - len(ready_ids)
+    waiting_for = ["waiting for another player"] * slots_needed
 
     for conn in snapshot_conns:
         server_seq_num += 1
