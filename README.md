@@ -46,36 +46,36 @@ Lightning Bolt, Shock, Lava Spike, Flame Slash, Searing Spear, Giant Growth and 
 ## Work Distribution Matrix
 
 Legend:
-✅: full contribution
-🟰: partial contribution
-❎: no contribution
+- ✅: full contribution
+- 🟰: partial contribution
+- ❌: no contribution
 
 | Task / Feature | Ileto, Miguel | Lee, Maria Isabella | Varela, Maxine | Yana, Jeon |
 |---|---|---|---|---|
-| TCP Server: connection handling, framing, dispatch | 🟰 | ❎ | ✅ | 🟰 |
-| Game lifecycle: LOBBY, GAME_SETUP, MULLIGAN logic | ❎ | ✅ | 🟰 | ✅ |
-| Turn & phase engine (all phases/steps, transitions) | ❎ | 🟰 | ✅ | ✅ |
-| Priority & Stack logic, spell/ability resolution | ❎ | 🟰 | ✅ | 🟰 |
-| Combat system (attackers, blockers, damage) | ❎ | 🟰 | 🟰 | 🟰 |
-| Client implementation & state rendering | ❎ | ✅ | 🟰 | ✅ |
-| PDU serialisation/deserialisation (all 25 PDU types) | ❎ | 🟰 | 🟰 | 🟰 |
-| Error handling, PING/PONG heartbeat, disconnect logic | ❎ | 🟰 | ✅ | 🟰 |
-| Verbose mode (client + server PDU logging, toggle on/off) | ❎ | ✅ | 🟰 | ❎ |
-| Testing & interoperability | ❎ | ✅ | ❎ | ✅ |
-| README / documentation / AI disclosure | ❎ | ✅ | ✅ | ✅ |
+| TCP Server: connection handling, framing, dispatch | 🟰 | ❌ | ✅ | 🟰 |
+| Game lifecycle: LOBBY, GAME_SETUP, MULLIGAN logic | ❌ | ✅ | 🟰 | ✅ |
+| Turn & phase engine (all phases/steps, transitions) | ❌ | 🟰 | ✅ | ✅ |
+| Priority & Stack logic, spell/ability resolution | ❌ | 🟰 | ✅ | 🟰 |
+| Combat system (attackers, blockers, damage) | ❌ | 🟰 | 🟰 | 🟰 |
+| Client implementation & state rendering | ❌ | ✅ | 🟰 | ✅ |
+| PDU serialisation/deserialisation (all 25 PDU types) | ❌ | 🟰 | 🟰 | 🟰 |
+| Error handling, PING/PONG heartbeat, disconnect logic | ❌ | 🟰 | ✅ | 🟰 |
+| Verbose mode (client + server PDU logging, toggle on/off) | ❌ | ✅ | 🟰 | ❌ |
+| Testing & interoperability | ❌ | ✅ | ❌ | ✅ |
+| README / documentation / AI disclosure | ❌ | ✅ | ✅ | ✅ |
 
 ## AI Usage
 
 The following were used:
 - ChatGPT:
-    To understand each part of specs
-    Asked help to generate code
+-     To understand each part of specs
+-     Asked help to generate code
 - Claude:
-    To understand each part of specs
-    Asked help to generate code
-    Asked help to check whether code meets specs
+-     To understand each part of specs
+-     Asked help to generate code
+-     Asked help to check whether code meets specs
 - Gemini:
-    To understand each part of specs
-    Asked help to generate code
-    Asked help to check whether code meets specs
-    To help understand some parts of the code
+-     To understand each part of specs
+-     Asked help to generate code
+-     Asked help to check whether code meets specs
+-     To help understand some parts of the code
