@@ -79,3 +79,5 @@ The following were used:
   * Asked help to generate code
   * Asked help to check whether code meets specs
   * To help understand some parts of the code
+
+All AI generated code were reviewed, tested, and verified by the members of the group before submitting the final output. 
