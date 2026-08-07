@@ -62,3 +62,8 @@ Replace the placeholders truthfully before submission; the course rubric require
 | README / documentation / AI disclosure | TBD | TBD | TBD | TBD |
 
 ## AI Usage
+
+The following were used:
+- ChatGPT:
+- Claude:
+- Gemini:
