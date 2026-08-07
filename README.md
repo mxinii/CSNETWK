@@ -49,9 +49,16 @@ Replace the placeholders truthfully before submission; the course rubric require
 
 | Task / Feature | Member 1 | Member 2 | Member 3 | Member 4 |
 |---|---|---|---|---|
-| TCP, framing, dispatch | TBD | TBD | TBD | TBD |
-| Lifecycle and mulligan | TBD | TBD | TBD | TBD |
-| Turn, priority, stack, combat | TBD | TBD | TBD | TBD |
-| Client, testing, documentation | TBD | TBD | TBD | TBD |
+| TCP Server: connection handling, framing, dispatch | TBD | TBD | TBD | TBD |
+| Game lifecycle: LOBBY, GAME_SETUP, MULLIGAN logic | TBD | TBD | TBD | TBD |
+| Turn & phase engine (all phases/steps, transitions) | TBD | TBD | TBD | TBD |
+| Priority & Stack logic, spell/ability resolution | TBD | TBD | TBD | TBD |
+| Combat system (attackers, blockers, damage) | TBD | TBD | TBD | TBD |
+| Client implementation & state rendering | TBD | TBD | TBD | TBD |
+| PDU serialisation/deserialisation (all 25 PDU types) | TBD | TBD | TBD | TBD |
+| Error handling, PING/PONG heartbeat, disconnect logic | TBD | TBD | TBD | TBD |
+| Verbose mode (client + server PDU logging, toggle on/off) | TBD | TBD | TBD | TBD |
+| Testing & interoperability | TBD | TBD | TBD | TBD |
+| README / documentation / AI disclosure | TBD | TBD | TBD | TBD |
 
 ## AI Usage
