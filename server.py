@@ -28,6 +28,7 @@ parser.add_argument("--port", type=port_number, default=PORT)
 args = parser.parse_args()
 VERBOSE = args.verbose
 HOST, PORT = args.host, args.port
+verbose_log_lock = threading.Lock()
 
 def log_pdu(direction: str, peer_label: str, pdu: dict):
     """Print a clearly-labelled, readable line for every PDU when verbose mode is on.
@@ -37,8 +38,11 @@ def log_pdu(direction: str, peer_label: str, pdu: dict):
     if not VERBOSE:
         return
     timestamp = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
-    label = f"S->{peer_label}" if direction == "SEND" else f"{peer_label}->S"
-    print(f"[VERBOSE {timestamp}] [{label}] {json.dumps(pdu)}")
+    label = (f"SERVER SEND -> {peer_label}" if direction == "SEND"
+             else f"SERVER RECV <- {peer_label}")
+    rendered = json.dumps(pdu, ensure_ascii=False, indent=2)
+    with verbose_log_lock:
+        print(f"\n[VERBOSE {timestamp}] [{label}]\n{rendered}", flush=True)
 
 # global game_phase
 game_phase = "LOBBY"
@@ -88,6 +92,7 @@ with open("card_instances.json", "r") as f:
 connected_clients = []       
 players = {}                 
 lock = threading.RLock()  # callbacks may safely invoke other state-changing helpers
+game_random = random.SystemRandom()
 stack_counter = 0
 attackers = []
 blockers = {}
@@ -134,10 +139,11 @@ def broadcast_lobby_status():
     global server_seq_num
     """Send every ready player an updated GAME_STATE_UPDATE (lobby variant)."""
     with lock:
-        ready_ids = [p["player_id"] for p in players.values()]
-        snapshot_conns = list(players.keys())
-    all_ids = ["player_1", "player_2"]
-    waiting_for = [pid for pid in all_ids if pid not in ready_ids]
+        ready_ids = [p["player_id"] for p in players.values() if p.get("ready", False)]
+        snapshot_conns = [conn for conn, info in players.items() if info.get("connected", True)]
+    # Player IDs are user-selected names, so they cannot be compared with the
+    # old hard-coded placeholders.  Report only the unoccupied lobby slots.
+    waiting_for = [f"player_{slot}" for slot in range(len(ready_ids) + 1, 3)]
 
     for conn in snapshot_conns:
         server_seq_num += 1
@@ -147,7 +153,7 @@ def broadcast_lobby_status():
             "seq_num": server_seq_num,
             "state": {
                 "phase": "LOBBY",
-                "players_ready": len(players),
+                "players_ready": len(ready_ids),
                 "waiting_for": waiting_for
             }
         })
@@ -229,7 +235,8 @@ def handle_player_ready(conn, pdu):
     with lock:
         # Check duplicate ID across existing connections
         for other_conn, other_info in players.items():
-            if other_conn != conn and other_info["player_id"] == player_id:
+            if (other_conn != conn
+                    and other_info["player_id"].casefold() == player_id.casefold()):
                 send_pdu(conn, {
                     "type": "ERROR",
                     "seq_num": pdu.get("seq_num", 1),
@@ -242,6 +249,7 @@ def handle_player_ready(conn, pdu):
         if conn in players:
             players[conn]["player_id"] = player_id
             players[conn]["deck_list"] = deck_list
+            players[conn]["ready"] = True
             print(f"[S] {player_id} updated their deck ({len(deck_list)} cards)")
         else:
             players[conn] = {
@@ -257,12 +265,14 @@ def handle_player_ready(conn, pdu):
                 "graveyard": [],
                 "land_played_this_turn": False,
                 "mana_pool": {c: 0 for c in "WUBRGC"},
+                "ready": True,
                 "connected": True,
                 "reconnect_timer": None
             }
             print(f"[S] {player_id} is ready with {len(deck_list)} cards ({len(players)}/2)")
 
-        if len(players) == 2 and game_phase == "LOBBY":
+        if (len(players) == 2 and game_phase == "LOBBY"
+                and all(info.get("ready", False) for info in players.values())):
             game_phase = "GAME_SETUP"
             should_start_setup = True
 
@@ -305,6 +315,7 @@ def build_personalized_mulligan_state(player):
             for info in players.values()
         },
         "hand": player["hand"],
+        "mana_pool": dict(player.get("mana_pool", {})),
         "hand_counts": {
             info["player_id"]: len(info["hand"])
             for info in players.values()
@@ -391,7 +402,7 @@ def start_game_setup():
         # shuffle deck
         for player in players.values():
             player["library"] = player["deck_list"][:]
-            random.shuffle(player["library"])
+            game_random.shuffle(player["library"])
 
         # draw seven cards
         for player in players.values():
@@ -400,11 +411,13 @@ def start_game_setup():
             while player["library"] and len(player["hand"]) < 7:
                 player["hand"].append(player["library"].pop())
 
-        # choose player to start
-        starting_conn = random.choice(list(players.keys()))
+        # Choose independently for every new match; connection/join order has
+        # no effect on who takes the first turn.
+        starting_conn = random.SystemRandom().choice(list(players.keys()))
 
         for conn, player in players.items():
             player["is_starting_player"] = (conn == starting_conn)
+        print(f"[S] Randomly selected {players[starting_conn]['player_id']} to go first")
 
         # Flip to MULLIGAN before sending, since a fast client could otherwise reply
         # before the server considers itself out of GAME_SETUP.
@@ -427,7 +440,7 @@ def redraw_hand(player):
     """London Mulligan redraw: shuffle hand back into library, reshuffle, draw a fresh 7."""
     player["library"].extend(player["hand"])
     player["hand"] = []
-    random.shuffle(player["library"])
+    game_random.shuffle(player["library"])
     while player["library"] and len(player["hand"]) < 7:
         player["hand"].append(player["library"].pop())
 
@@ -554,6 +567,7 @@ def grant_priority(conn):
         "type": "PRIORITY_GRANT",
         "player_id": players[conn]["player_id"],
         "seq_num": server_seq_num,
+        "step": current_step,
         "time_limit_ms": 60000
     })
 
@@ -683,6 +697,7 @@ def trigger_game_over(winner_conn, reason):
         player_info["is_starting_player"] = False
         player_info["land_played_this_turn"] = False
         player_info["mana_pool"] = {c: 0 for c in "WUBRGC"}
+        player_info["ready"] = False
 
     # Notify remaining clients of returning to LOBBY
     broadcast_lobby_status()
@@ -739,91 +754,44 @@ def handle_play_land(conn, pdu):
     Sorcery-speed, Active-Player-only, one per turn, doesn't touch the stack.
     The Active Player retains priority afterward (a fresh PRIORITY_GRANT)."""
     if game_phase != "IN_GAME":
-        send_pdu(conn, {
-            "type": "ERROR",
-            "seq_num": pdu.get("seq_num", 0),
-            "code": "WRONG_PHASE",
-            "message": "PLAY_LAND is only valid during IN_GAME.",
-            "rejected_action": pdu
-        })
+        error(conn, pdu, "WRONG_PHASE", "PLAY_LAND is only valid during IN_GAME.")
         return
 
     if current_step not in ("PRECOMBAT_MAIN", "POSTCOMBAT_MAIN"):
-        send_pdu(conn, {
-            "type": "ERROR",
-            "seq_num": pdu.get("seq_num", 0),
-            "code": "WRONG_PHASE",
-            "message": "Lands may only be played during a Main Phase.",
-            "rejected_action": pdu
-        })
+        error(conn, pdu, "WRONG_PHASE", "Lands may only be played during a Main Phase.")
         return
 
     with lock:
         # PLAY_LAND is a priority-bearing PDU (RFC 5.4) — same seq_num/holder
         # rules as PRIORITY_PASS apply.
         if conn != priority_conn:
-            send_pdu(conn, {
-                "type": "ERROR",
-                "seq_num": pdu.get("seq_num", 0),
-                "code": "NOT_YOUR_PRIORITY",
-                "message": "You do not currently hold priority.",
-                "rejected_action": pdu
-            })
+            error(conn, pdu, "NOT_YOUR_PRIORITY", "You do not currently hold priority.")
             return
 
         if pdu.get("seq_num") != priority_seq_num:
-            send_pdu(conn, {
-                "type": "ERROR",
-                "seq_num": pdu.get("seq_num", 0),
-                "code": "STALE_ACTION",
-                "message": f"Priority token mismatch. Expected seq_num {priority_seq_num}, got {pdu.get('seq_num')}.",
-                "rejected_action": pdu
-            })
+            error(conn, pdu, "STALE_ACTION",
+                  f"Priority token mismatch. Expected seq_num {priority_seq_num}, got {pdu.get('seq_num')}.")
             return
 
         if conn != active_conn:
-            send_pdu(conn, {
-                "type": "ERROR",
-                "seq_num": pdu.get("seq_num", 0),
-                "code": "ILLEGAL_ACTION",
-                "message": "Only the Active Player may play a land.",
-                "rejected_action": pdu
-            })
+            error(conn, pdu, "ILLEGAL_ACTION", "Only the Active Player may play a land.")
             return
 
         player = players[conn]
 
         if player["land_played_this_turn"]:
-            send_pdu(conn, {
-                "type": "ERROR",
-                "seq_num": pdu.get("seq_num", 0),
-                "code": "ILLEGAL_ACTION",
-                "message": "You have already played a land this turn.",
-                "rejected_action": pdu
-            })
+            error(conn, pdu, "ILLEGAL_ACTION", "You have already played a land this turn.")
             return
 
         card_id = pdu.get("card_id")
 
         if card_id not in player["hand"]:
-            send_pdu(conn, {
-                "type": "ERROR",
-                "seq_num": pdu.get("seq_num", 0),
-                "code": "ILLEGAL_ACTION",
-                "message": f"Card '{card_id}' is not in your hand.",
-                "rejected_action": pdu
-            })
+            error(conn, pdu, "ILLEGAL_ACTION", f"Card '{card_id}' is not in your hand.")
             return
 
         card_info = cards.get(card_id)
         if card_info is None or card_info.get("card_type") != "Land":
-            send_pdu(conn, {
-                "type": "ERROR",
-                "seq_num": pdu.get("seq_num", 0),
-                "code": "ILLEGAL_ACTION",
-                "message": f"Card '{card_id}' is not a Land.",
-                "rejected_action": pdu
-            })
+            error(conn, pdu, "ILLEGAL_ACTION", f"Card '{card_id}' is not a Land.")
             return
 
         # Apply: move from hand to battlefield as an untapped permanent.
@@ -992,6 +960,13 @@ def handle_concede(conn, pdu):
 def error(conn, pdu, code, message):
     send_pdu(conn, {"type": "ERROR", "seq_num": pdu.get("seq_num", 0),
                     "code": code, "message": message, "rejected_action": pdu})
+    # A rejected priority action must not strand the player.  The authoritative
+    # state is unchanged, so issue a fresh token and let them choose again.
+    retryable = {"PLAY_LAND", "CAST_SPELL", "ACTIVATE_ABILITY", "PRIORITY_PASS"}
+    if (game_phase == "IN_GAME" and conn == priority_conn
+            and pdu.get("type") in retryable
+            and code not in ("STALE_ACTION", "NOT_YOUR_PRIORITY")):
+        grant_priority(conn)
 
 def string_id(value):
     return isinstance(value,str) and 0 < len(value.strip()) <= 128 and not any(ord(ch)<32 for ch in value)
@@ -1070,7 +1045,15 @@ def pay_generic(player, amount):
 def legal_target(target):
     if target in [p["player_id"] for p in players.values()]:
         return True
+    if any(target == item.get("stack_item_id") for item in stack):
+        return True
     return any(target == perm.get("id") for p in players.values() for perm in p["battlefield"])
+
+def legal_target_ids():
+    ids = [p["player_id"] for p in players.values()]
+    ids.extend(perm.get("id") for p in players.values() for perm in p["battlefield"])
+    ids.extend(item.get("stack_item_id") for item in stack)
+    return [target for target in ids if target]
 
 def handle_cast_spell(conn, pdu):
     global stack_counter, consecutive_passes, trigger_resume_conn
@@ -1090,8 +1073,13 @@ def handle_cast_spell(conn, pdu):
         if card.get("card_type") in ("Creature", "Sorcery") and (conn != active_conn or current_step not in ("PRECOMBAT_MAIN", "POSTCOMBAT_MAIN") or stack):
             error(conn, pdu, "WRONG_PHASE", "Sorcery-speed spell cannot be cast now."); return
         targets = pdu.get("targets", [])
-        if not isinstance(targets, list) or any(not legal_target(t) for t in targets):
-            error(conn, pdu, "ILLEGAL_TARGET", "One or more targets are illegal."); return
+        invalid_targets = (["targets must be a list"] if not isinstance(targets, list)
+                           else [target for target in targets if not legal_target(target)])
+        if invalid_targets:
+            valid = ", ".join(legal_target_ids()) or "none"
+            error(conn, pdu, "ILLEGAL_TARGET",
+                  f"Unknown target ID(s): {', '.join(map(str, invalid_targets))}. Valid targets: {valid}.")
+            return
         if not pay_mana(player, card):
             error(conn, pdu, "INSUFFICIENT_MANA", "Not enough untapped lands."); return
         player["hand"].remove(card_id)
