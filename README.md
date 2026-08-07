@@ -67,15 +67,15 @@ Legend:
 ## AI Usage
 
 The following were used:
-- ChatGPT:
--     To understand each part of specs
--     Asked help to generate code
-- Claude:
--     To understand each part of specs
--     Asked help to generate code
--     Asked help to check whether code meets specs
-- Gemini:
--     To understand each part of specs
--     Asked help to generate code
--     Asked help to check whether code meets specs
--     To help understand some parts of the code
+* ChatGPT:
+  * To understand each part of specs
+  * Asked help to generate code
+* Claude:
+  * To understand each part of specs
+  * Asked help to generate code
+  * Asked help to check whether code meets specs
+* Gemini:
+  * To understand each part of specs
+  * Asked help to generate code
+  * Asked help to check whether code meets specs
+  * To help understand some parts of the code
